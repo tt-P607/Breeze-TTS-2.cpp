@@ -12,15 +12,25 @@ namespace breeze {
 #endif
 
 bool GGUFModel::load(const std::string & path, Backend & be) {
+    free();
     gguf_init_params gp{ /*no_alloc=*/true, /*ctx=*/&meta };
     gguf = gguf_init_from_file(path.c_str(), gp);
-    if (!gguf) return false;
+    if (!gguf) {
+        free();
+        return false;
+    }
 
     buffer = ggml_backend_alloc_ctx_tensors(meta, be.backend);
-    if (!buffer) return false;
+    if (!buffer) {
+        free();
+        return false;
+    }
 
     FILE * f = fopen(path.c_str(), "rb");
-    if (!f) return false;
+    if (!f) {
+        free();
+        return false;
+    }
 
     const size_t data_off = gguf_get_data_offset(gguf);
     const int64_t n = gguf_get_n_tensors(gguf);
@@ -31,8 +41,16 @@ bool GGUFModel::load(const std::string & path, Backend & be) {
         const size_t off = data_off + gguf_get_tensor_offset(gguf, i);
         const size_t sz = ggml_nbytes(t);
         buf.resize(sz);
-        if (breeze_fseek(f, (long long) off, SEEK_SET) != 0) { fclose(f); return false; }
-        if (fread(buf.data(), 1, sz, f) != sz) { fclose(f); return false; }
+        if (breeze_fseek(f, (long long) off, SEEK_SET) != 0) {
+            fclose(f);
+            free();
+            return false;
+        }
+        if (fread(buf.data(), 1, sz, f) != sz) {
+            fclose(f);
+            free();
+            return false;
+        }
         ggml_backend_tensor_set(t, buf.data(), 0, sz);
         tensors[name] = t;
     }
@@ -44,6 +62,7 @@ void GGUFModel::free() {
     if (buffer) ggml_backend_buffer_free(buffer);
     if (meta) ggml_free(meta);
     if (gguf) gguf_free(gguf);
+    tensors.clear();
     buffer = nullptr;
     meta = nullptr;
     gguf = nullptr;

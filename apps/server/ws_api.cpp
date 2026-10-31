@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <shared_mutex>
 #include <thread>
 
 namespace breeze {
@@ -193,7 +194,13 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
 }
 
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
-                   GenScheduler & sched, int chunk_first, int chunk_max, int split_chars) {
+                   GenScheduler & sched, std::shared_mutex & model_gate,
+                   int chunk_first, int chunk_max, int split_chars) {
+    std::shared_lock<std::shared_mutex> model_lock(model_gate, std::try_to_lock);
+    if (!model_lock) {
+        event(conn, "error", "\"message\":\"model_switching\"");
+        return;
+    }
     Session s;
     std::thread worker([&] { speaker(conn, s, sched); });
     event(conn, "ready", "\"sample_rate\":24000,\"format\":\"s16le\"");

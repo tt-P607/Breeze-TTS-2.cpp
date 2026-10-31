@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
+#include <shared_mutex>
 
 namespace breeze {
 
@@ -166,7 +167,8 @@ void VoiceStore::put(const std::string & id, CachedVoice v) {
 }
 
 void VoiceStore::add_routes(httplib::Server & svr, BreezeModel & model, MimiCodec & codec,
-                            GenScheduler & sched, const std::string & dir) {
+                            GenScheduler & sched, std::shared_mutex & model_gate,
+                            const std::string & dir) {
     const int sr = model.cfg.sample_rate;
     const int spf = model.cfg.samples_per_frame;
     const int ncb = model.cfg.num_codebooks;
@@ -185,6 +187,8 @@ void VoiceStore::add_routes(httplib::Server & svr, BreezeModel & model, MimiCode
     };
 
     svr.Post("/v1/voices", [&, sr, spf, write_file](const httplib::Request & req, httplib::Response & res) {
+        std::shared_lock<std::shared_mutex> model_lock(model_gate, std::try_to_lock);
+        if (!model_lock) return fail(res, 409, "model_switching");
         const std::string text = field(req, "ref_text", "");
         const std::string name = field(req, "name", "");
         if (!req.has_file("ref_audio") || text.empty())

@@ -1,11 +1,15 @@
 #pragma once
 
+#include <map>
 #include <string>
 
 namespace breeze {
 
 struct ServerOptions {
     std::string model;
+    std::string model_id = "default";
+    std::map<std::string, std::string> switchable_loras;
+    int lora_cache_size = 1;
     std::string host = "127.0.0.1";
     int port = 8080;
     bool use_gpu = true;

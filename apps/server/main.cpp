@@ -2,13 +2,20 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <string>
 
 using namespace breeze;
 
 int main(int argc, char ** argv) {
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
-        printf("usage: breeze-server <model.gguf> [--host H] [--port P] [--webui] [--cpu]\n");
+        printf("usage: breeze-server <model.gguf> [--model-id ID]\n");
+        printf("                     [--switchable-lora ID=PATH]...\n");
+        printf("                     [--lora-cache-size N]\n");
+        printf("                     [--host H] [--port P] [--webui] [--cpu]\n");
         printf("                     [--chunk-first N] [--chunk-max N] [--verbose]\n");
         printf("                     [--voices-dir PATH] [--ws-port P] [--split-chars N]\n");
         printf("                     [--cors [ORIGINS]] [--no-warmup] [--parallel N]\n");
@@ -21,6 +28,9 @@ int main(int argc, char ** argv) {
         printf("                 whole thing through in one pass. a request can still override it\n");
         printf("  --verbose      add a per stage timing breakdown to each request\n");
         printf("  --voices-dir   folder of saved .breeze voices to load at startup (default voices)\n");
+        printf("  --model-id     ID of the initially loaded model (default default)\n");
+        printf("  --switchable-lora ID=PATH   register a LoRA adapter loaded on selection; repeatable\n");
+        printf("  --lora-cache-size N          maximum resident LoRA adapters (default 1)\n");
         printf("  --ws-port      websocket port for streaming sessions, default is the http port + 1,\n");
         printf("                 -1 turns it off\n");
         printf("  --cors         let browser pages on other origins call the api. on its own it allows\n");
@@ -34,10 +44,44 @@ int main(int argc, char ** argv) {
     }
     ServerOptions opts;
     opts.model = argv[1];
+    const auto valid_model_id = [](const std::string & id) {
+        if (id.empty()) return false;
+        for (unsigned char c : id)
+            if (!std::isalnum(c) && c != '-' && c != '_' && c != '.') return false;
+        return true;
+    };
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--host" && i + 1 < argc) opts.host = argv[++i];
         else if (a == "--port" && i + 1 < argc) opts.port = atoi(argv[++i]);
+        else if (a == "--model-id" && i + 1 < argc) opts.model_id = argv[++i];
+        else if (a == "--switchable-lora" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const size_t eq = spec.find('=');
+            if (eq == std::string::npos || !valid_model_id(spec.substr(0, eq)) || eq + 1 == spec.size()) {
+                fprintf(stderr, "%s requires ID=PATH: %s\n", a.c_str(), spec.c_str());
+                return 1;
+            }
+            const std::string id = spec.substr(0, eq), path = spec.substr(eq + 1);
+            auto & entries = opts.switchable_loras;
+            auto it = entries.find(id);
+            if (it != entries.end() && it->second != path) {
+                fprintf(stderr, "duplicate model ID with different paths: %s\n", id.c_str());
+                return 1;
+            }
+            entries[id] = path;
+        }
+        else if (a == "--lora-cache-size" && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            errno = 0;
+            const long count = std::strtol(value, &end, 10);
+            if (errno || end == value || *end != '\0' || count < 1 || count > INT_MAX) {
+                fprintf(stderr, "--lora-cache-size requires a positive integer\n");
+                return 1;
+            }
+            opts.lora_cache_size = static_cast<int>(count);
+        }
         else if (a == "--webui") opts.webui = true;
         else if (a == "--verbose" || a == "-v") opts.verbose = true;
         else if (a == "--voices-dir" && i + 1 < argc) opts.voices_dir = argv[++i];
@@ -63,6 +107,14 @@ int main(int argc, char ** argv) {
     }
     if (opts.chunk_first < 1 || opts.chunk_max < 1) {
         fprintf(stderr, "chunk sizes must be at least 1\n");
+        return 1;
+    }
+    if (!valid_model_id(opts.model_id)) {
+        fprintf(stderr, "invalid model ID: %s\n", opts.model_id.c_str());
+        return 1;
+    }
+    if (opts.switchable_loras.count(opts.model_id)) {
+        fprintf(stderr, "base model ID conflicts with a LoRA ID: %s\n", opts.model_id.c_str());
         return 1;
     }
     return run_server(opts);

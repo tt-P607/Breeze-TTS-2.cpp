@@ -28,6 +28,51 @@ static void scratch_graph(Backend & be) {
     require(tensor_to_f32(out).front() == 9.0f, "temporary graph failed");
 }
 
+static void test_lora_projection(BreezeModel & m) {
+    const std::string base_name = "bb.blk.0.attn_q.weight";
+    ggml_tensor * base = m.w(base_name);
+    auto adapter = std::make_unique<LoraAdapter>();
+    adapter->scale = 0.5f;
+
+    ggml_init_params params{ggml_tensor_overhead() * 2 + 4096, nullptr, true};
+    adapter->gg.meta = ggml_init(params);
+    require(adapter->gg.meta != nullptr, "LoRA test context allocation failed");
+    ggml_tensor * a = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F32, base->ne[0], 1);
+    ggml_tensor * b = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F32, 1, base->ne[1]);
+    const std::string a_name = base_name + ".lora_a";
+    const std::string b_name = base_name + ".lora_b";
+    ggml_set_name(a, a_name.c_str());
+    ggml_set_name(b, b_name.c_str());
+    adapter->gg.tensors.emplace(a_name, a);
+    adapter->gg.tensors.emplace(b_name, b);
+    adapter->gg.buffer = ggml_backend_alloc_ctx_tensors(adapter->gg.meta, m.backend.backend);
+    require(adapter->gg.buffer != nullptr, "LoRA test buffer allocation failed");
+
+    std::vector<float> av(base->ne[0], 0.0f), bv(base->ne[1], 0.0f);
+    av[0] = 1.0f;
+    bv[0] = 2.0f;
+    ggml_backend_tensor_set(a, av.data(), 0, av.size() * sizeof(float));
+    ggml_backend_tensor_set(b, bv.data(), 0, bv.size() * sizeof(float));
+    m.loras.emplace("test-lora", std::move(adapter));
+
+    std::vector<float> input(base->ne[0], 0.25f);
+    input[0] = 3.0f;
+    Graph base_graph(64);
+    ggml_tensor * x = base_graph.input_f32(input, (int) base->ne[0]);
+    ggml_tensor * base_out = m.project(base_graph.ctx, base_name, x);
+    base_graph.compute(m.backend, base_out);
+    std::vector<float> expected = tensor_to_f32(base_out);
+    expected[0] += input[0];
+
+    require(m.set_lora("test-lora"), "LoRA selection failed");
+    Graph lora_graph(64);
+    x = lora_graph.input_f32(input, (int) base->ne[0]);
+    ggml_tensor * actual = m.project(lora_graph.ctx, base_name, x);
+    lora_graph.compute(m.backend, actual);
+    close(tensor_to_f32(actual), expected);
+    m.clear_lora();
+}
+
 static void test_graph(Backend & be) {
     Graph g(64);
     auto * x = g.input_f32(std::vector<float>(32, 0.0f), 32);
@@ -385,6 +430,7 @@ int main(int argc, char ** argv) {
             }
             std::printf("testing %s with %s weights\n", fixture.model.backend.name(), quantized ? "Q8_0" : "F32");
             test_graph(fixture.model.backend);
+            test_lora_projection(fixture.model);
             test_depth(fixture.model);
             test_fused(fixture.model);
             test_batched_depth(fixture.model);
@@ -392,7 +438,7 @@ int main(int argc, char ** argv) {
             test_backbone(fixture.model);
             test_swiglu(fixture.model);
         }
-        std::puts("graph replay, depth cache, CFG backbone and SwiGLU tests passed");
+        std::puts("graph replay, LoRA projection, depth cache, CFG backbone and SwiGLU tests passed");
         return 0;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());

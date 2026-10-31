@@ -42,10 +42,32 @@ breeze-server <model.gguf> [--host H] [--port P] [--webui] [--cpu]
 | `--cors` | off | Let browser pages on other origins call the API. On its own it allows any origin; give a comma separated list to allow only those. See [Cross origin requests](#cross-origin-requests). |
 | `--no-warmup` | off | Skip the warm up at startup. See below. |
 | `--parallel` | `1` | Streams generating at once. A stream using guidance counts as two. See [performance.md](performance.md#running-several-streams). |
+| `--model-id` | `default` | ID of the initial full model. |
+| `--switchable-lora ID=PATH` | none | Register a LoRA adapter without loading it. See [lora.md](lora.md). |
+| `--lora-cache-size` | `1` | Maximum number of resident LoRA adapters. The base model is shared. |
 
 ```
 breeze-server breeze-tts-2-q4_k.gguf --port 8137 --webui
 ```
+
+For example, start one base model and register two LoRA adapters:
+
+```
+breeze-server base.gguf --model-id base \
+  --switchable-lora voice-a=voice-a.gguf \
+  --switchable-lora voice-b=voice-b.gguf
+```
+
+Read the active ID and configured choices with `GET /v1/models`. Select a model
+by sending `POST /v1/models/active` with JSON such as
+`{"model_id":"voice-b"}`. Selecting the already active ID is a no-op.
+The server shares the base model and loads adapters only when selected.
+`--lora-cache-size` controls how many adapters remain resident. A switch returns `409` while an
+HTTP generation or a WebSocket session is active; close WebSocket connections
+before switching. Selecting the base ID disables the active adapter.
+The endpoint only accepts localhost requests. A request can register an adapter
+with `{"model_id":"voice-c","lora_path":"/absolute/path/voice-c.gguf"}`.
+See [lora.md](lora.md) for conversion and cache behavior.
 
 Before it starts listening the server runs a short throwaway generation for every
 mix of streams its `--parallel` setting allows, with and without guidance, and

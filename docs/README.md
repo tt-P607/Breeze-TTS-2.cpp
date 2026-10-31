@@ -2,6 +2,8 @@
 
 | Document | Contents |
 | --- | --- |
+| [usage-zh.md](usage-zh.md) | 中文使用指南：模型、参考音色、情绪、笑声、停顿和 Bot 调用流程 |
+| [lora.md](lora.md) | LoRA 转换、加载和模型切换 |
 | [build.md](build.md) | Toolchain requirements, CMake options, backend selection, troubleshooting |
 | [models.md](models.md) | Downloading weights, GGUF conversion, quantization, tensor layout |
 | [cli.md](cli.md) | `breeze-cli` flags and usage recipes |

@@ -8,6 +8,7 @@
 
 #include "breeze/scheduler.h"
 
+#include <shared_mutex>
 #include <string>
 
 namespace breeze {
@@ -15,6 +16,7 @@ namespace breeze {
 // handles one websocket connection until it closes. a connection that finds every slot taken
 // waits its turn rather than being turned away
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
-                   GenScheduler & sched, int chunk_first, int chunk_max, int split_chars);
+                   GenScheduler & sched, std::shared_mutex & model_gate,
+                   int chunk_first, int chunk_max, int split_chars);
 
 } // namespace breeze

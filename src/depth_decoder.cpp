@@ -71,21 +71,23 @@ static ggml_tensor * dd_layer(ggml_context * ctx, BreezeModel & m, ggml_tensor *
 
     ggml_tensor * res = x;
     ggml_tensor * h = rms_norm(ctx, x, m.w(p + ".attn_norm.weight"), c.rms_eps);
-    ggml_tensor * q = ggml_reshape_3d(ctx, linear(ctx, m.w(p + ".attn_q.weight"), h), c.head_dim, c.n_head, n);
-    ggml_tensor * k = ggml_reshape_3d(ctx, linear(ctx, m.w(p + ".attn_k.weight"), h), c.head_dim, c.n_kv_head, n);
-    ggml_tensor * v = ggml_reshape_3d(ctx, linear(ctx, m.w(p + ".attn_v.weight"), h), c.head_dim, c.n_kv_head, n);
+    ggml_tensor * q = ggml_reshape_3d(ctx, m.project(ctx, p + ".attn_q.weight", h), c.head_dim, c.n_head, n);
+    ggml_tensor * k = ggml_reshape_3d(ctx, m.project(ctx, p + ".attn_k.weight", h), c.head_dim, c.n_kv_head, n);
+    ggml_tensor * v = ggml_reshape_3d(ctx, m.project(ctx, p + ".attn_v.weight", h), c.head_dim, c.n_kv_head, n);
     q = ggml_rope_ext(ctx, q, pos, ff, c.head_dim, GGML_ROPE_TYPE_NEOX, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(ctx, k, pos, ff, c.head_dim, GGML_ROPE_TYPE_NEOX, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
     ggml_tensor * kfull = nullptr, * vfull = nullptr;
     kv(il, k, v, kfull, vfull);
     ggml_tensor * a = attention(ctx, q, kfull, vfull, mask, scale, c.n_head, c.n_kv_head);
-    a = linear(ctx, m.w(p + ".attn_output.weight"), a);
+    a = m.project(ctx, p + ".attn_output.weight", a);
     x = ggml_add(ctx, res, a);
 
     res = x;
     h = rms_norm(ctx, x, m.w(p + ".ffn_norm.weight"), c.rms_eps);
-    h = swiglu_ffn(ctx, h, m.w(p + ".ffn_gate.weight"), m.w(p + ".ffn_up.weight"), m.w(p + ".ffn_down.weight"));
+    ggml_tensor * gate = m.project(ctx, p + ".ffn_gate.weight", h);
+    ggml_tensor * up = m.project(ctx, p + ".ffn_up.weight", h);
+    h = m.project(ctx, p + ".ffn_down.weight", ggml_swiglu_split(ctx, gate, up));
     return ggml_add(ctx, res, h);
 }
 
@@ -105,7 +107,7 @@ static std::unique_ptr<DepthStep> build_depth_step(BreezeModel & m, DepthRunner 
         step->hidden = g.input_f32(std::vector<float>((size_t) nb * m.cfg.hidden_size), m.cfg.hidden_size, nb);
         embed = ggml_concat(g.ctx, step->hidden, embed, 1);
     }
-    ggml_tensor * x = linear(g.ctx, m.w("dd.in_proj.weight"), embed); // [1024, n_tok]
+    ggml_tensor * x = m.project(g.ctx, "dd.in_proj.weight", embed); // [1024, n_tok]
 
     std::vector<int32_t> pos_i(n_tok);
     for (int i = 0; i < n_tok; i++) pos_i[i] = start + i / nb;
@@ -177,7 +179,7 @@ static std::unique_ptr<DepthFused> build_depth_fused(BreezeModel & m, DepthRunne
             ggml_tensor * table = ggml_view_2d(ctx, embd, embd->ne[0], vs, embd->nb[1], (size_t) h * vs * embd->nb[1]);
             embed = ggml_get_rows(ctx, table, code_rows);
         }
-        ggml_tensor * x = linear(ctx, m.w("dd.in_proj.weight"), embed);
+        ggml_tensor * x = m.project(ctx, "dd.in_proj.weight", embed);
 
         std::vector<int32_t> pos_i(n_tok);
         for (int i = 0; i < n_tok; i++) pos_i[i] = start + i / rows;

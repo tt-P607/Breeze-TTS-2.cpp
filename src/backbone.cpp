@@ -5,13 +5,15 @@
 
 namespace breeze {
 
-static ggml_tensor * bb_linear(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, bool f32_batch) {
+static ggml_tensor * bb_project(ggml_context * ctx, BreezeModel & m, const std::string & name,
+                               ggml_tensor * x, bool f32_batch) {
+    ggml_tensor * w = m.w(name);
     if (f32_batch && ggml_is_quantized(w->type)) {
         // a row stride keeps Vulkan from quantizing batched F32 activations
         auto * padded = ggml_pad(ctx, x, 1, 0, 0, 0);
         x = ggml_view_2d(ctx, padded, x->ne[0], x->ne[1], padded->nb[1], 0);
     }
-    return linear(ctx, w, x);
+    return m.project(ctx, name, x);
 }
 
 void BackboneState::init(BreezeModel & m, int max_seq) {
@@ -53,7 +55,7 @@ static ggml_tensor * bb_layer(ggml_context * ctx, BreezeModel & m, Graph & g, co
     const bool batch = states.size() > 1;
     const bool f32_batch = batch && std::string(m.backend.name()).find("Vulkan") == 0;
     auto project = [&](const char * suffix, ggml_tensor * input) {
-        return bb_linear(ctx, m.w(p + suffix), input, f32_batch);
+        return bb_project(ctx, m, p + suffix, input, f32_batch);
     };
 
     ggml_tensor * res = x;
@@ -109,7 +111,7 @@ StepOut backbone_run(BreezeModel & m, BackboneState & st, const std::vector<floa
 
     ggml_tensor * last = ggml_view_2d(g.ctx, x, c.hidden, 1, x->nb[1], (size_t) (n - 1) * x->nb[1]);
     last = ggml_cont(g.ctx, last);
-    ggml_tensor * logits = linear(g.ctx, m.w("bb.lm_head.weight"), last);
+    ggml_tensor * logits = m.project(g.ctx, "bb.lm_head.weight", last);
 
     ggml_set_output(last);
     g.write(last);
@@ -138,7 +140,7 @@ std::vector<StepOut> backbone_run_batch(BreezeModel & m, const std::vector<Backb
     for (int il = 0; il < c.n_layer; il++)
         x = bb_layer(g.ctx, m, g, states, x, il, pos, masks, rows);
     x = rms_norm(g.ctx, x, m.w("bb.output_norm.weight"), c.rms_eps);
-    auto * logits = bb_linear(g.ctx, m.w("bb.lm_head.weight"), x,
+    auto * logits = bb_project(g.ctx, m, "bb.lm_head.weight", x,
                              rows > 1 && std::string(m.backend.name()).find("Vulkan") == 0);
     ggml_set_output(x);
     g.write(x);

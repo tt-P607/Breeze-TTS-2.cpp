@@ -1,5 +1,6 @@
 #include "server.h"
 #include "encode.h"
+#include "json.h"
 #include "openai.h"
 #include "voices.h"
 #include "ws.h"
@@ -17,7 +18,12 @@
 #include <windows.h> // after httplib, it pulls in winsock2 first
 #endif
 
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <chrono>
+#include <map>
+#include <shared_mutex>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -61,6 +67,16 @@ static std::string cors_origin(const std::string & allowed, const httplib::Reque
         start = end + 1;
     }
     return "";
+}
+
+static bool loopback_peer(const std::string & address) {
+    return address == "::1" || address == "localhost" ||
+           address.rfind("127.", 0) == 0 || address.rfind("::ffff:127.", 0) == 0;
+}
+
+static void fail(httplib::Response & res, int status, const char * message) {
+    res.status = status;
+    res.set_content(std::string("{\"error\":\"") + message + "\"}", "application/json");
 }
 
 // gives the slot back when the response is finished, the stream outlives the handler
@@ -129,26 +145,14 @@ int run_server(const ServerOptions & opts) {
     printf("backend: %s, sample rate: %d\n", model.backend.name(), model.cfg.sample_rate);
     MimiCodec codec;
     codec.init(model);
+    GenScheduler sched;
+    sched.start(model, opts.parallel);
     if (opts.warmup) {
-        printf("warming up ...\n");
-        fflush(stdout);
-        const auto tw = std::chrono::steady_clock::now();
         GenRequest base;
         base.chunk_first = opts.chunk_first;
         base.chunk_max = opts.chunk_max;
         try {
             warm_up(model, codec, base);
-            printf("warmed up in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count());
-        } catch (const std::exception & e) {
-            fprintf(stderr, "warm up failed: %s\n", e.what());
-        }
-    }
-
-    GenScheduler sched;
-    sched.start(model, opts.parallel);
-    if (opts.warmup) {
-        GenRequest base;
-        try {
             sched.warm_up(base);
         } catch (const std::exception & e) {
             fprintf(stderr, "warm up failed: %s\n", e.what());
@@ -157,30 +161,159 @@ int run_server(const ServerOptions & opts) {
     if (opts.parallel > 1) printf("up to %d streams at once\n", opts.parallel);
 
     httplib::Server svr;
+    std::shared_mutex model_gate;
+    std::string active_model_id = opts.model_id;
+    std::map<std::string, std::string> allowed_loras = opts.switchable_loras;
+    std::string active_lora_path;
+    std::map<std::string, std::string> cached_loras; // path -> loaded adapter slot
+    std::vector<std::string> lora_recency; // least recently selected first
+    uint64_t next_lora_slot = 0;
     const int sr = model.cfg.sample_rate;
 
     VoiceStore store;
     store.load_dir(opts.voices_dir, model.cfg.num_codebooks);
-    store.add_routes(svr, model, codec, sched, opts.voices_dir);
+    store.add_routes(svr, model, codec, sched, model_gate, opts.voices_dir);
 
     WsServer ws;
     const int ws_port = opts.ws_port == 0 ? opts.port + 1 : opts.ws_port;
     if (ws_port > 0) {
         const bool up = ws.start(opts.host, ws_port, [&](WsConn & c) {
-            ws_connection(c, model, codec, store, sched, opts.chunk_first, opts.chunk_max, opts.split_chars);
+            ws_connection(c, model, codec, store, sched, model_gate,
+                          opts.chunk_first, opts.chunk_max, opts.split_chars);
         });
         if (up) printf("websocket on ws://%s:%d\n", opts.host.c_str(), ws_port);
         else fprintf(stderr, "could not open the websocket port %d\n", ws_port);
     }
 
     svr.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-        res.set_content("{\"status\":\"ok\",\"sample_rate\":" + std::to_string(sr) +
+        std::shared_lock<std::shared_mutex> lock(model_gate, std::try_to_lock);
+        if (!lock) {
+            res.status = 503;
+            res.set_content("{\"status\":\"switching\"}", "application/json");
+            return;
+        }
+        res.set_content("{\"status\":\"ok\",\"model_id\":\"" + active_model_id + "\",\"sample_rate\":" + std::to_string(sr) +
                         ",\"ws_port\":" + std::to_string(ws_port > 0 ? ws_port : 0) + "}",
                         "application/json");
     });
 
+    svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
+        std::shared_lock<std::shared_mutex> lock(model_gate, std::try_to_lock);
+        if (!lock) return fail(res, 503, "model_switching");
+        std::string body = "{\"object\":\"list\",\"active_model\":\"" + active_model_id + "\",\"data\":[";
+        body += "{\"id\":\"" + opts.model_id + "\",\"object\":\"model\"}";
+        for (const auto & entry : allowed_loras)
+            body += ",{\"id\":\"" + entry.first + "\",\"object\":\"model\"}";
+        res.set_content(body + "]}", "application/json");
+    });
+
+    svr.Post("/v1/models/active", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!loopback_peer(req.remote_addr))
+            return fail(res, 403, "model switching is restricted to localhost");
+        if (req.get_header_value("Content-Type").find("json") == std::string::npos)
+            return fail(res, 415, "application/json required");
+        JVal body;
+        if (!JParser(req.body).parse(body) || body.kind != JVal::Obj)
+            return fail(res, 400, "request body must be a JSON object");
+        auto field = body.obj.find("model_id");
+        if (field == body.obj.end() || field->second.kind != JVal::Str || field->second.str.empty())
+            return fail(res, 400, "model_id is required");
+        const std::string target_id = field->second.str;
+        for (unsigned char c : target_id)
+            if (!std::isalnum(c) && c != '-' && c != '_' && c != '.')
+                return fail(res, 400, "invalid model_id");
+        const auto path_field = body.obj.find("lora_path");
+        const bool has_path = path_field != body.obj.end();
+        std::string requested_path;
+        if (has_path) {
+            if (path_field->second.kind != JVal::Str || path_field->second.str.empty())
+                return fail(res, 400, "lora_path must be a nonempty absolute path");
+            requested_path = path_field->second.str;
+            try {
+                const auto path = std::filesystem::u8path(requested_path);
+                if (!path.is_absolute()) return fail(res, 400, "lora_path must be absolute");
+            } catch (const std::exception &) {
+                return fail(res, 400, "invalid lora_path");
+            }
+        }
+
+        const auto selected = [&](bool changed) {
+            res.set_content("{\"active_model\":\"" + active_model_id + "\",\"changed\":" +
+                            (changed ? "true}" : "false}"), "application/json");
+        };
+
+        // 同一模型直接返回；正在推理时也无需等待或重新加载。
+        {
+            std::shared_lock<std::shared_mutex> lock(model_gate, std::try_to_lock);
+            if (!lock) return fail(res, 409, "model_switching");
+            if (active_model_id == target_id && (!has_path || requested_path == active_lora_path))
+                return selected(false);
+        }
+
+        std::unique_lock<std::shared_mutex> model_lock(model_gate, std::try_to_lock);
+        if (!model_lock)
+            return fail(res, 409, "busy: close active WebSocket sessions and finish inference before switching");
+        // 改为独占锁前，其他切换请求可能已经选中了目标模型。
+        if (active_model_id == target_id && (!has_path || requested_path == active_lora_path))
+            return selected(false);
+
+        // 推理与参考音频编码均持有共享锁，拿到独占锁后即可切换。
+
+        if (has_path && target_id == opts.model_id)
+            return fail(res, 400, "model_id is reserved for the base model");
+        const auto target_lora = allowed_loras.find(target_id);
+        if (!has_path && target_lora == allowed_loras.end() && target_id != opts.model_id)
+            return fail(res, 404, "unknown model_id");
+        if (!has_path && target_lora == allowed_loras.end()) {
+            sched.exec([&] {
+                sched.pool().free();
+                model.clear_lora();
+            });
+            active_lora_path.clear();
+        } else {
+            const std::string target_path = has_path ? requested_path : target_lora->second;
+            if (target_path != active_lora_path) {
+                auto cached = cached_loras.find(target_path);
+                const bool needs_load = cached == cached_loras.end();
+                const std::string slot = needs_load
+                    ? "__breeze_lora_" + std::to_string(next_lora_slot++) : cached->second;
+                bool loaded = false, activated = false;
+                sched.exec([&] {
+                    loaded = !needs_load || model.load_lora(slot, target_path);
+                    if (!loaded) return;
+                    // Cached depth graphs reference adapter tensors, so discard them before switching.
+                    sched.pool().free();
+                    activated = model.set_lora(slot);
+                    if (!activated && needs_load) model.unload_lora(slot);
+                });
+                if (!loaded)
+                    return fail(res, 422, "failed to load LoRA adapter; previous model remains active");
+                if (!activated) return fail(res, 500, "failed to activate LoRA adapter");
+                if (needs_load) cached_loras.emplace(target_path, slot);
+                else printf("LoRA cache hit: %s\n", target_id.c_str());
+                lora_recency.erase(std::remove(lora_recency.begin(), lora_recency.end(), target_path),
+                                   lora_recency.end());
+                lora_recency.push_back(target_path);
+                active_lora_path = target_path;
+                while (lora_recency.size() > static_cast<size_t>(opts.lora_cache_size)) {
+                    const std::string evicted = lora_recency.front();
+                    lora_recency.erase(lora_recency.begin());
+                    sched.exec([&] { model.unload_lora(cached_loras.at(evicted)); });
+                    cached_loras.erase(evicted);
+                    printf("LoRA cache evicted: %s\n", evicted.c_str());
+                }
+            }
+            if (has_path) allowed_loras[target_id] = requested_path;
+        }
+        active_model_id = target_id;
+        printf("active LoRA selection: %s\n", active_model_id.c_str());
+        fflush(stdout);
+        return selected(true);
+    });
+
     // openai clients post json to the same path, the form fields keep the native behaviour
-    const auto speak_openai = [&](const httplib::Request & req, httplib::Response & res) {
+    const auto speak_openai = [&](const httplib::Request & req, httplib::Response & res,
+                                  std::shared_ptr<std::shared_lock<std::shared_mutex>> model_lock) {
         OpenAiSpeech o;
         int status = 200;
         const std::string err = parse_openai_speech(req.body, store, opts.split_chars, o, status);
@@ -213,7 +346,7 @@ int run_server(const ServerOptions & opts) {
         fflush(stdout);
 
         res.set_chunked_content_provider(
-            ctype, [&model, &codec, &sched, g = o.g, sse = o.sse, enc, slot, sr, verbose = opts.verbose](
+            ctype, [&model, &codec, &sched, g = o.g, sse = o.sse, enc, slot, model_lock, sr, verbose = opts.verbose](
                        size_t, httplib::DataSink & sink) {
                 std::string buf;
                 const auto flush = [&] {
@@ -243,8 +376,10 @@ int run_server(const ServerOptions & opts) {
     };
 
     svr.Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
+        auto model_lock = std::make_shared<std::shared_lock<std::shared_mutex>>(model_gate, std::try_to_lock);
+        if (!model_lock->owns_lock()) return fail(res, 409, "model_switching");
         if (req.get_header_value("Content-Type").find("json") != std::string::npos) {
-            speak_openai(req, res);
+            speak_openai(req, res, model_lock);
             return;
         }
         const int cost = sched.cost((float) atof(field(req, "cfg_scale", "1.0").c_str()));
@@ -328,7 +463,7 @@ int run_server(const ServerOptions & opts) {
 
         res.set_chunked_content_provider(
             "audio/pcm",
-            [&model, &codec, &sched, g, slot, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
+            [&model, &codec, &sched, g, slot, model_lock, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
                 run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
                     const std::vector<uint8_t> pcm = to_pcm16(s, n);
                     return sink.write((const char *) pcm.data(), pcm.size());
@@ -339,6 +474,8 @@ int run_server(const ServerOptions & opts) {
     });
 
     svr.Post("/v1/audio/convert", [&](const httplib::Request & req, httplib::Response & res) {
+        auto model_lock = std::make_shared<std::shared_lock<std::shared_mutex>>(model_gate, std::try_to_lock);
+        if (!model_lock->owns_lock()) return fail(res, 409, "model_switching");
         // this one runs for a while and doesnt share a batch, so it needs the whole gpu
         if (!sched.try_acquire(sched.parallel())) {
             res.status = 409;
