@@ -1,7 +1,5 @@
 #pragma once
 
-#include <shared_mutex>
-
 namespace httplib { class Server; }
 
 namespace breeze {
@@ -11,10 +9,11 @@ struct MimiCodec;
 class GenScheduler;
 class VoiceStore;
 class Models;
+class RequestQueue;
 struct ServerOptions;
 
 void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & codec,
                      GenScheduler & scheduler, VoiceStore & voices, Models & models,
-                     std::shared_mutex & execution_gate, const ServerOptions & options);
+                     RequestQueue & execution_queue, const ServerOptions & options);
 
 }

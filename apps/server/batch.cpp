@@ -41,14 +41,6 @@ struct Item {
     size_t samples = 0;
 };
 
-// A batch owns its execution permit; its individual jobs only reserve GPU slots.
-struct Slot {
-    GenScheduler & scheduler;
-    int count;
-    Slot(GenScheduler & scheduler, int count) : scheduler(scheduler), count(count) { scheduler.acquire(count); }
-    ~Slot() { scheduler.release(count); }
-};
-
 void finish_wav(std::string & bytes) {
     const uint32_t riff = (uint32_t) bytes.size() - 8;
     const uint32_t data = (uint32_t) bytes.size() - 44;
@@ -62,7 +54,7 @@ void finish_wav(std::string & bytes) {
 
 void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & codec,
                      GenScheduler & scheduler, VoiceStore & voices, Models & models,
-                     std::shared_mutex & execution_gate, const ServerOptions & options) {
+                     RequestQueue & execution_queue, const ServerOptions & options) {
     server.Post("/v1/audio/speech/batch", [&](const httplib::Request & request, httplib::Response & response) {
         const auto fail = [&](int status, const std::string & error) {
             response.status = status;
@@ -121,8 +113,6 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
             items.push_back(std::move(item));
         }
 
-        RequestExecution permit(execution_gate, parallel);
-        if (!permit.owns_lock()) return fail(409, "busy: execution mode is occupied");
         const auto started = Clock::now();
         std::atomic<size_t> next{0};
         const auto worker = [&] {
@@ -133,8 +123,10 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
                 if (!item.error.empty()) continue;
                 const auto item_started = Clock::now();
                 try {
-                    Slot slot(scheduler, scheduler.cost(item.speech.g.cfg_scale));
-                    auto lease = models.acquire(item.selection, item.status, item.error);
+                    RequestExecution permit(execution_queue, parallel, scheduler.cost(item.speech.g.cfg_scale),
+                                             request.is_connection_closed);
+                    if (!permit.acquired()) return;
+                    auto lease = models.acquire(item.selection, item.status, item.error, request.is_connection_closed);
                     if (!lease) continue;
                     item.speech.g.lora_id = lease->slot();
                     std::string sent, content_type;
@@ -142,6 +134,7 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
                     encoder->begin(item.audio);
                     GenTimings timings;
                     generate(model, codec, item.speech.g, [&](const float * samples, int count) {
+                        if (request.is_connection_closed()) return false;
                         if (!item.samples) item.first_audio_ms = elapsed_ms(item_started);
                         encoder->write(samples, count, item.audio);
                         item.samples += (size_t) count;

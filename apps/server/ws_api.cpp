@@ -107,20 +107,6 @@ struct Session {
     std::atomic<bool> cancel{false};
 };
 
-struct SlotHold {
-    GenScheduler & sched;
-    int n;
-    bool held = true;
-
-    SlotHold(GenScheduler & scheduler, int count) : sched(scheduler), n(count) {}
-    ~SlotHold() { release(); }
-    void release() {
-        if (!held) return;
-        sched.release(n);
-        held = false;
-    }
-};
-
 } // namespace
 
 static void event(WsConn & c, const std::string & type, const std::string & extra = "") {
@@ -129,7 +115,7 @@ static void event(WsConn & c, const std::string & type, const std::string & extr
 
 // drains the queue one piece at a time, taking a slot for each so other connections interleave
 static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & models,
-                    std::shared_mutex & execution_gate) {
+                    RequestQueue & execution_queue) {
     for (;;) {
         Piece piece;
         Models::Selection selected;
@@ -160,19 +146,9 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
             continue;
         }
 
-        RequestExecution permit(execution_gate, parallel_execution, true);
-        if (s.cancel) {
-            s.cancel = false;
-            event(conn, "cancelled");
-            continue;
-        }
-        if (!conn.alive()) return;
-
-        if (!sched.try_acquire(s.cost)) {
-            event(conn, "queued");
-            sched.acquire(s.cost);
-        }
-        SlotHold slot(sched, s.cost);
+        const auto cancelled = [&] { return s.cancel || !conn.alive(); };
+        RequestExecution permit(execution_queue, parallel_execution, s.cost, cancelled,
+                                [&] { event(conn, "queued"); });
         if (s.cancel) {
             s.cancel = false;
             event(conn, "cancelled");
@@ -185,13 +161,19 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
         std::string error;
         std::shared_ptr<Models::Lease> lease;
         try {
-            lease = models.acquire(selected, status, error);
+            lease = models.acquire(selected, status, error, cancelled);
         } catch (const std::exception & e) {
             error = e.what();
         } catch (...) {
             error = "failed to acquire LoRA adapter";
         }
         if (!lease) {
+            if (!conn.alive()) return;
+            if (s.cancel) {
+                s.cancel = false;
+                event(conn, "cancelled");
+                continue;
+            }
             (void) status;
             event(conn, "error", "\"message\":\"" + esc(error) + "\"");
             continue;
@@ -237,7 +219,7 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
             continue;
         }
         lease.reset();
-        slot.release();
+        permit.release();
 
         if (s.cancel) { event(conn, "cancelled"); s.cancel = false; continue; }
         if (!ok && !conn.alive()) return;
@@ -331,10 +313,10 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
 
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
                    GenScheduler & sched, Models & models,
-                   std::shared_mutex & execution_gate,
+                   RequestQueue & execution_queue,
                    int chunk_first, int chunk_max, int split_chars) {
     Session s;
-    std::thread worker([&] { speaker(conn, s, sched, models, execution_gate); });
+    std::thread worker([&] { speaker(conn, s, sched, models, execution_queue); });
     event(conn, "ready", "\"sample_rate\":24000,\"format\":\"s16le\"");
 
     std::string raw;

@@ -1,5 +1,6 @@
 #include "voices.h"
 #include "json.h"
+#include "execution.h"
 
 #include "breeze/audio.h"
 #include "breeze/voice.h"
@@ -166,7 +167,7 @@ void VoiceStore::put(const std::string & id, CachedVoice v) {
 }
 
 void VoiceStore::add_routes(httplib::Server & svr, BreezeModel & model, MimiCodec & codec,
-                            GenScheduler & sched, const std::string & dir) {
+                            GenScheduler & sched, RequestQueue & execution_queue, const std::string & dir) {
     const int sr = model.cfg.sample_rate;
     const int spf = model.cfg.samples_per_frame;
     const int ncb = model.cfg.num_codebooks;
@@ -199,7 +200,7 @@ void VoiceStore::add_routes(httplib::Server & svr, BreezeModel & model, MimiCode
         // a named voice is written to disk under that name, an unnamed one just lives in memory
         const std::string id = name.empty() ? voice_key(f.content, text) : name;
         CachedVoice v;
-        {
+        const auto serve_cached = [&] {
             std::lock_guard<std::mutex> vg(m_mutex);
             auto it = m_voices.find(id);
             if (it != m_voices.end()) {
@@ -209,13 +210,15 @@ void VoiceStore::add_routes(httplib::Server & svr, BreezeModel & model, MimiCode
                 if (name.empty()) {
                     CachedVoice next = it->second;
                     const std::string err = apply_meta(meta, next);
-                    if (!err.empty()) return fail(res, 400, err);
+                    if (!err.empty()) { fail(res, 400, err); return true; }
                     it->second = std::move(next);
                     res.set_content(voice_json(id, it->second, sr, spf), "application/json");
-                    return;
+                    return true;
                 }
             }
-        }
+            return false;
+        };
+        if (serve_cached()) return;
         const std::string err = apply_meta(meta, v);
         if (!err.empty()) return fail(res, 400, err);
 
@@ -224,12 +227,14 @@ void VoiceStore::add_routes(httplib::Server & svr, BreezeModel & model, MimiCode
         if (pcm.empty()) return fail(res, 400, "could not read ref_audio");
 
         // encoding runs on the same device generation does, so it waits its turn
-        if (!sched.try_acquire()) return fail(res, 409, "busy");
+        RequestExecution permit(execution_queue, false, 1, req.is_connection_closed);
+        if (!permit.acquired()) { res.status = 499; return; }
+        // Another upload may have encoded the same unnamed reference while this one waited.
+        if (name.empty() && serve_cached()) return;
 
         v.text = text;
         const auto t0 = std::chrono::steady_clock::now();
         sched.exec([&] { v.codes = codec.encode(pcm, v.frames); });
-        sched.release();
         v.encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
         if (!name.empty()) {

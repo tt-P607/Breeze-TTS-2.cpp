@@ -25,7 +25,6 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
-#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -77,14 +76,6 @@ static void fail(httplib::Response & res, int status, const std::string & messag
     res.status = status;
     res.set_content(std::string("{\"error\":\"") + message + "\"}", "application/json");
 }
-
-// gives the slot back when the response is finished, the stream outlives the handler
-struct SlotHold {
-    GenScheduler & sched;
-    int n;
-    SlotHold(GenScheduler & s, int count) : sched(s), n(count) {}
-    ~SlotHold() { sched.release(n); }
-};
 
 // one generation with the console progress bar, emit gets each decoded chunk and false stops it
 static void run_generation(BreezeModel & model, MimiCodec & codec, GenScheduler & sched, const GenRequest & g, int sr,
@@ -161,7 +152,7 @@ int run_server(const ServerOptions & opts) {
 
     Models models(model, sched, opts.model_id, opts.switchable_loras,
                   opts.lora_cache_size, opts.lora_idle_seconds);
-    std::shared_mutex execution_gate;
+    RequestQueue execution_queue(sched);
     const int sr = model.cfg.sample_rate;
 
     VoiceStore store;
@@ -169,13 +160,13 @@ int run_server(const ServerOptions & opts) {
 
     // Declare the server after Models so its workers are destroyed before their cache manager.
     httplib::Server svr;
-    store.add_routes(svr, model, codec, sched, opts.voices_dir);
+    store.add_routes(svr, model, codec, sched, execution_queue, opts.voices_dir);
 
     WsServer ws;
     const int ws_port = opts.ws_port == 0 ? opts.port + 1 : opts.ws_port;
     if (ws_port > 0) {
         const bool up = ws.start(opts.host, ws_port, [&](WsConn & c) {
-            ws_connection(c, model, codec, store, sched, models, execution_gate,
+            ws_connection(c, model, codec, store, sched, models, execution_queue,
                           opts.chunk_first, opts.chunk_max, opts.split_chars);
         });
         if (up) printf("websocket on ws://%s:%d\n", opts.host.c_str(), ws_port);
@@ -229,7 +220,7 @@ int run_server(const ServerOptions & opts) {
                         (old_default == active ? "false}" : "true}"), "application/json");
     });
 
-    add_batch_route(svr, model, codec, sched, store, models, execution_gate, opts);
+    add_batch_route(svr, model, codec, sched, store, models, execution_queue, opts);
 
     const auto select_form_model = [&](const httplib::Request & req, Models::Selection & selection,
                                        int & status, std::string & error) {
@@ -268,20 +259,10 @@ int run_server(const ServerOptions & opts) {
                             "application/json");
             return;
         }
-        auto permit = std::make_shared<RequestExecution>(execution_gate, o.parallel);
-        if (!permit->owns_lock()) {
-            res.status = 409;
-            res.set_content(openai_error("busy: execution mode is occupied", "server_error"), "application/json");
-            return;
-        }
         const int cost = sched.cost(o.g.cfg_scale);
-        if (!sched.try_acquire(cost)) {
-            res.status = 409;
-            res.set_content(openai_error("busy, every generation slot is taken", "server_error"), "application/json");
-            return;
-        }
-        auto slot = std::make_shared<SlotHold>(sched, cost);
-        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error);
+        auto permit = std::make_shared<RequestExecution>(execution_queue, o.parallel, cost, req.is_connection_closed);
+        if (!permit->acquired()) { res.status = 499; return; }
+        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, req.is_connection_closed);
         if (!lease) {
             res.status = status;
             res.set_content(openai_error(error, status == 409 || status == 422 ? "server_error" : "invalid_request_error"),
@@ -306,7 +287,7 @@ int run_server(const ServerOptions & opts) {
         fflush(stdout);
 
         res.set_chunked_content_provider(
-            ctype, [&model, &codec, &sched, g = o.g, sse = o.sse, enc, slot, lease, permit, sr, verbose = opts.verbose](
+            ctype, [&model, &codec, &sched, g = o.g, sse = o.sse, enc, lease, permit, sr, verbose = opts.verbose](
                        size_t, httplib::DataSink & sink) {
                 std::string buf;
                 const auto flush = [&] {
@@ -363,12 +344,10 @@ int run_server(const ServerOptions & opts) {
         const std::string execution = field(req, "execution", "serial");
         if (execution != "serial" && execution != "parallel")
             return fail(res, 400, "execution must be serial or parallel");
-        auto permit = std::make_shared<RequestExecution>(execution_gate, execution == "parallel");
-        if (!permit->owns_lock()) return fail(res, 409, "busy: execution mode is occupied");
         const int cost = sched.cost(g.cfg_scale);
-        if (!sched.try_acquire(cost)) return fail(res, 409, "busy");
-        auto slot = std::make_shared<SlotHold>(sched, cost);
-        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error);
+        auto permit = std::make_shared<RequestExecution>(execution_queue, execution == "parallel", cost, req.is_connection_closed);
+        if (!permit->acquired()) { res.status = 499; return; }
+        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, req.is_connection_closed);
         if (!lease) return fail(res, status, error);
         g.lora_id = lease->slot();
         if (req.has_file("ref_audio")) {
@@ -431,7 +410,7 @@ int run_server(const ServerOptions & opts) {
 
         res.set_chunked_content_provider(
             "audio/pcm",
-            [&model, &codec, &sched, g, slot, lease, permit, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
+            [&model, &codec, &sched, g, lease, permit, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
                 run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
                     const std::vector<uint8_t> pcm = to_pcm16(s, n);
                     return sink.write((const char *) pcm.data(), pcm.size());
@@ -479,15 +458,9 @@ int run_server(const ServerOptions & opts) {
         int status = 0;
         std::string error;
         if (!select_form_model(req, selection, status, error)) return fail(res, status, error);
-        RequestExecution permit(execution_gate, false);
-        if (!permit.owns_lock()) return fail(res, 409, "busy: execution mode is occupied");
-        // Conversion runs alone, then restores the previous per-thread LoRA selection.
-        if (!sched.try_acquire(sched.parallel())) return fail(res, 409, "busy");
-        struct AllSlots {
-            GenScheduler & s;
-            ~AllSlots() { s.release(s.parallel()); }
-        } all_slots{sched};
-        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error);
+        RequestExecution permit(execution_queue, false, sched.parallel(), req.is_connection_closed);
+        if (!permit.acquired()) { res.status = 499; return; }
+        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, req.is_connection_closed);
         if (!lease) return fail(res, status, error);
 
         printf("conv %.2f s source, %s\n", (double) src.size() / sr,

@@ -621,6 +621,9 @@ struct Request {
   std::string local_addr;
   int local_port = -1;
 
+  // Valid during the server handler, including while waiting for generation.
+  std::function<bool()> is_connection_closed;
+
   // for server
   std::string version;
   std::string target;
@@ -7100,6 +7103,7 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
 
   req.local_addr = local_addr;
   req.local_port = local_port;
+  req.is_connection_closed = [&strm] { return !detail::is_socket_alive(strm.socket()); };
   req.set_header("LOCAL_ADDR", req.local_addr);
   req.set_header("LOCAL_PORT", std::to_string(req.local_port));
 

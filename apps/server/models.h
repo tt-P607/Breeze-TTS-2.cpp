@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,7 +50,8 @@ public:
     // after acquire() has loaded the path successfully.
     bool select(bool has_id, const std::string & id, bool has_path, const std::string & path,
                 Selection & out, int & status, std::string & error) const;
-    std::shared_ptr<Lease> acquire(const Selection & selected, int & status, std::string & error);
+    std::shared_ptr<Lease> acquire(const Selection & selected, int & status, std::string & error,
+                                   const std::function<bool()> & cancelled = {});
 
     bool set_default(const std::string & id, int & status, std::string & error);
     std::string default_id() const;
@@ -80,6 +82,7 @@ private:
     const int m_idle_timeout_seconds;
 
     mutable std::mutex m_mutex;
+    std::condition_variable m_available;
     std::map<std::string, std::string> m_registered; // model ID -> normalized path; base ID has an empty path
     std::map<std::string, Entry> m_cache;             // normalized path -> resident adapter
     std::map<std::string, std::chrono::steady_clock::time_point> m_last_used;

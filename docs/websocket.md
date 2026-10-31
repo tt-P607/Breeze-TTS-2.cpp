@@ -62,7 +62,7 @@ an evicted adapter reloads automatically when that session speaks again.
 | `ready` | `sample_rate`, `format` | Connection is up. Send `start`. |
 | `started` | `voice_id` | Session is open. |
 | `speaking` | `text` | The piece about to be generated. |
-| `queued` | | Every generation slot is taken. Waiting, not refused. |
+| `queued` | | Waiting for the shared queue, execution mode or generation slots. |
 | `instruction_set` | | The new delivery applies to text sent from here on. |
 | `cancelled` | | Generation was interrupted. |
 | `done` | | Everything buffered has been spoken. |
@@ -133,9 +133,9 @@ The session stays open. Send more text and it carries on with the same voice.
 ## Concurrency
 
 The server generates as many streams at once as its `--parallel` setting allows,
-one by default, and a session using guidance counts as two. Unlike the HTTP
-endpoints, which answer `409` when full, a socket session **waits its turn** and
-reports `queued` while it does. Each piece takes its slots separately, so connections
+one by default, and a session using guidance counts as two. HTTP, WebSocket, and batch
+items share the backend FIFO queue. A socket session **waits its turn** and reports
+`queued` while it does. Each piece takes its slots separately, so connections
 interleave between pieces instead of one blocking the others for an entire passage.
 See [performance.md](performance.md#running-several-streams).
 

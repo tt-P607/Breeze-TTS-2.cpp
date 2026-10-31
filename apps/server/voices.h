@@ -12,6 +12,7 @@
 #include <vector>
 
 namespace breeze {
+class RequestQueue;
 
 // form fields arrive as either a file part or a plain param depending on the client
 inline std::string field(const httplib::Request & req, const char * name, const std::string & def) {
@@ -45,7 +46,7 @@ public:
     void put(const std::string & id, CachedVoice v);
 
     void add_routes(httplib::Server & svr, BreezeModel & model, MimiCodec & codec, GenScheduler & sched,
-                    const std::string & dir);
+                    RequestQueue & execution_queue, const std::string & dir);
 
 private:
     std::map<std::string, CachedVoice> m_voices;

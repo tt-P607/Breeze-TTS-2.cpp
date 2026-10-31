@@ -26,6 +26,7 @@ import traceback
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urlencode, urlsplit
 
 import requests
 from websockets.sync.client import connect
@@ -268,7 +269,7 @@ def save_pcm(path, pcm, sample_rate):
 
 def synthesize(server, report, report_lock, label, model_id, lora_path=None,
                max_new_tokens=8, text=SHORT_TEXT, save_audio=True, timeout=HTTP_TIMEOUT,
-               execution=None):
+               execution=None, on_response=None):
     started = time.monotonic()
     client, response = open_speech(
         server.url,
@@ -276,6 +277,8 @@ def synthesize(server, report, report_lock, label, model_id, lora_path=None,
         timeout=timeout,
     )
     try:
+        if on_response is not None:
+            on_response(response)
         if not response.ok:
             body = response.text[:1000]
             raise SmokeFailure(
@@ -289,6 +292,7 @@ def synthesize(server, report, report_lock, label, model_id, lora_path=None,
         item = {
             "label": label,
             "model_id": model_id,
+            "http_status": response.status_code,
             "lora_path": str(lora_path) if lora_path is not None else None,
             "sha256": hashlib.sha256(pcm).hexdigest(),
             "sample_rate": sample_rate,
@@ -372,6 +376,28 @@ def receive_ws_started(connection):
             return event
 
 
+def receive_ws_event(connection, expected_type, timeout=15):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            message = connection.recv(timeout=min(5, max(0.1, deadline - time.monotonic())))
+        except TimeoutError:
+            continue
+        if isinstance(message, bytes):
+            continue
+        event = json.loads(message)
+        event_type = event.get("type")
+        if event_type == "error":
+            raise SmokeFailure(f"WebSocket returned an error while waiting for {expected_type}: {event}")
+        if event_type == expected_type:
+            return event
+        if event_type in {"speaking", "done", "cancelled"}:
+            raise SmokeFailure(
+                f"expected WebSocket {expected_type}, got {event_type}: {event}"
+            )
+    raise TimeoutError(f"WebSocket did not send {expected_type}")
+
+
 def receive_ws_audio_until_done(connection, timeout=HTTP_TIMEOUT):
     audio = bytearray()
     events = []
@@ -421,6 +447,57 @@ def websocket_sample(server, model_id, text, flush=False):
         else:
             connection.send(json.dumps({"type": "end", "text": text}))
         return receive_ws_audio_until_done(connection)
+
+
+def cancel_queued_websocket(server, adapter_path):
+    model_id = "cancelled-ws-queued"
+    with connect(server.ws_url, open_timeout=15, close_timeout=5) as connection:
+        greeting = json.loads(connection.recv(timeout=15))
+        require(greeting.get("type") == "ready", f"unexpected WebSocket greeting: {greeting}")
+        connection.send(
+            json.dumps(
+                {
+                    "type": "start",
+                    "model_id": model_id,
+                    "lora_path": str(adapter_path),
+                    "instruction": SHORT_INSTRUCTION,
+                    "seed": 42,
+                    "cfg_scale": 1,
+                    "split_chars": 0,
+                    "max_new_tokens": 8,
+                    "execution": "serial",
+                }
+            )
+        )
+        receive_ws_started(connection)
+        connection.send(json.dumps({"type": "end", "text": SHORT_TEXT}))
+        receive_ws_event(connection, "queued")
+        connection.send(json.dumps({"type": "cancel"}))
+        receive_ws_event(connection, "cancelled")
+    return model_id
+
+
+def disconnect_queued_http(server, form):
+    target = urlsplit(server.url)
+    body = urlencode(form).encode("ascii")
+    request = (
+        f"POST /v1/audio/speech HTTP/1.1\r\n"
+        f"Host: {target.hostname}:{target.port}\r\n"
+        "Content-Type: application/x-www-form-urlencoded\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: keep-alive\r\n\r\n"
+    ).encode("ascii") + body
+    with socket.create_connection((target.hostname, target.port), timeout=5) as connection:
+        connection.settimeout(0.35)
+        connection.sendall(request)
+        try:
+            first_byte = connection.recv(1)
+        except socket.timeout:
+            first_byte = None
+        require(
+            first_byte is None,
+            "queued HTTP request returned a response before its execution slot was available",
+        )
 
 
 def check_startup_registration(server, report, adapters, idle_seconds, cache_size):
@@ -480,19 +557,27 @@ def test_serial_and_dynamic_paths(server, report, report_lock, adapter_paths):
     return pcm_a, pcm_b
 
 
-def test_serial_gate(server, report, report_lock):
-    token_count = 16
-    text = "这段短文本用于验证串行请求的执行门控。"
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        active = pool.submit(
+def test_serial_gate(server, report, report_lock, adapter_paths):
+    text = "这段短文本用于验证请求排队和执行顺序。"
+    response_order = []
+    response_order_lock = threading.Lock()
+
+    def record_response_start(label):
+        def record(response):
+            with response_order_lock:
+                response_order.append({"label": label, "status": response.status_code})
+        return record
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        holder = pool.submit(
             synthesize,
             server,
             report,
             report_lock,
-            "serial-gate-holder",
+            "serial-queue-holder",
             "voice-a",
             None,
-            token_count,
+            16,
             text,
             False,
             HTTP_TIMEOUT,
@@ -503,32 +588,128 @@ def test_serial_gate(server, report, report_lock):
             "voice-a",
             lambda row: row["loaded"] and row["in_use"],
             timeout=60,
-            reason="serial holder did not acquire adapter A",
+            reason="serial queue holder did not acquire adapter A",
         )
-        serial_rejected = expect_bad_speech(
-            server,
-            speech_form("voice-b", execution="serial"),
-            "second serial request while serial generation is active",
-            expected_status=409,
+
+        def queue_speech(label, model_id, execution, max_new_tokens, submitted):
+            submitted.set()
+            return synthesize(
+                server,
+                report,
+                report_lock,
+                label,
+                model_id,
+                None,
+                max_new_tokens,
+                text,
+                False,
+                HTTP_TIMEOUT,
+                execution,
+                record_response_start(label),
+            )
+
+        serial_submitted = threading.Event()
+        serial = pool.submit(
+            queue_speech,
+            "serial-queued-b",
+            "voice-b",
+            "serial",
+            8,
+            serial_submitted,
         )
-        parallel_rejected = expect_bad_speech(
+        require(serial_submitted.wait(5), "second HTTP request was not submitted")
+        time.sleep(0.2)
+
+        parallel_submitted = threading.Event()
+        parallel = pool.submit(
+            queue_speech,
+            "parallel-queued-base",
+            "base",
+            "parallel",
+            8,
+            parallel_submitted,
+        )
+        require(parallel_submitted.wait(5), "third HTTP request was not submitted")
+        time.sleep(0.2)
+
+        rows = server.model_rows()
+        require(rows["voice-a"]["in_use"], "serial holder ended before queueing was observed")
+        require(not rows["voice-b"]["in_use"], "queued serial request started before its holder ended")
+        require(not rows["base"]["in_use"], "queued parallel request started before its holder ended")
+        require(not serial.done(), "second HTTP request returned while the serial holder was active")
+        require(not parallel.done(), "third HTTP request returned while the serial holder was active")
+
+        ws_cancelled_id = cancel_queued_websocket(server, adapter_paths["voice-a"])
+        http_cancelled_id = "cancelled-http-queued"
+        disconnect_queued_http(
             server,
-            speech_form("voice-b", execution="parallel"),
-            "parallel request while serial generation is active",
-            expected_status=409,
+            speech_form(
+                http_cancelled_id,
+                adapter_paths["voice-a"],
+                max_new_tokens=8,
+                execution="serial",
+            ),
+        )
+
+        pcm_holder, holder_item = holder.result(timeout=HTTP_TIMEOUT + 30)
+        require(pcm_holder, "serial queue holder request returned no audio")
+        wait_for_model(
+            server,
+            "voice-b",
+            lambda row: row["loaded"] and row["in_use"],
+            timeout=HTTP_TIMEOUT,
+            reason="queued serial request did not start after its holder ended",
+        )
+        rows = server.model_rows()
+        require(not rows["base"]["in_use"], "parallel request started ahead of queued serial work")
+
+        pcm_serial, serial_item = serial.result(timeout=HTTP_TIMEOUT + 30)
+        require(pcm_serial, "queued serial request returned no audio")
+        require(serial_item["http_status"] == 200, "queued serial request did not return HTTP 200")
+        wait_for_model(
+            server,
+            "base",
+            lambda row: row["in_use"],
+            timeout=HTTP_TIMEOUT,
+            reason="queued parallel request did not start after the serial request",
         )
         require(
-            server.model_rows()["voice-a"]["in_use"],
-            "serial holder ended before both busy responses were checked",
+            not server.model_rows()["voice-b"]["in_use"],
+            "queued serial request was still active when the next parallel request started",
         )
-        pcm, _ = active.result(timeout=HTTP_TIMEOUT + 30)
-    require(pcm, "serial holder request returned no audio")
+
+        pcm_parallel, parallel_item = parallel.result(timeout=HTTP_TIMEOUT + 30)
+        require(pcm_parallel, "queued parallel request returned no audio")
+        require(parallel_item["http_status"] == 200, "queued parallel request did not return HTTP 200")
+        require(
+            [entry["label"] for entry in response_order]
+            == ["serial-queued-b", "parallel-queued-base"],
+            f"HTTP queue did not start requests FIFO: {response_order}",
+        )
+
+    # A request that was cancelled before acquiring the queue must never register
+    # its request-level ID, even after the following queued work drains.
+    time.sleep(0.5)
+    rows = server.model_rows()
+    require(ws_cancelled_id not in rows, "cancelled queued WebSocket request was executed")
+    require(http_cancelled_id not in rows, "disconnected queued HTTP request was executed")
+    require(
+        not any(rows[model_id]["in_use"] for model_id in ("voice-a", "voice-b", "base")),
+        "a queued speech request remained active after all responses completed",
+    )
+    require(holder_item["http_status"] == 200, "serial queue holder did not return HTTP 200")
     append_check(
         report,
-        "serial requests exclude other serial and parallel single requests",
+        "serial and parallel HTTP requests queue FIFO; queued disconnects cancel",
         {
-            "second_serial_status": serial_rejected["status"],
-            "parallel_while_serial_status": parallel_rejected["status"],
+            "http_statuses": [
+                holder_item["http_status"],
+                serial_item["http_status"],
+                parallel_item["http_status"],
+            ],
+            "response_start_order": [entry["label"] for entry in response_order],
+            "cancelled_websocket_id": ws_cancelled_id,
+            "cancelled_http_id": http_cancelled_id,
         },
     )
 
@@ -1105,7 +1286,7 @@ def run(args):
         pcm_a, pcm_b = test_serial_and_dynamic_paths(
             server, report, report_lock, adapters
         )
-        test_serial_gate(server, report, report_lock)
+        test_serial_gate(server, report, report_lock, adapters)
         test_parallel_requests(server, report, report_lock, pcm_a, pcm_b)
         test_batch_api(server, report)
         test_failures_and_default(server, report, report_lock, output_dir, pcm_b)

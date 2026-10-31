@@ -124,10 +124,19 @@ bool Models::select(bool has_id, const std::string & id, bool has_path, const st
     return true;
 }
 
-std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int & status, std::string & error) {
+std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int & status, std::string & error,
+                                             const std::function<bool()> & cancelled) {
     status = 200;
     error.clear();
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    const auto aborted = [&] {
+        if (!cancelled || !cancelled()) return false;
+        status = 499;
+        error = "request cancelled";
+        return true;
+    };
+    if (aborted()) return {};
 
     if (selected.path.empty()) {
         if (selected.id != m_base_id) {
@@ -140,17 +149,13 @@ std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int &
     }
 
     auto found = m_cache.find(selected.path);
+    while (found == m_cache.end() && m_cache.size() >= (std::size_t) m_capacity &&
+           std::none_of(m_cache.begin(), m_cache.end(), [](const auto & entry) { return entry.second.users == 0; })) {
+        m_available.wait_for(lock, std::chrono::milliseconds(100));
+        if (aborted()) return {};
+        found = m_cache.find(selected.path);
+    }
     if (found == m_cache.end()) {
-        bool can_evict = m_cache.size() < (std::size_t) m_capacity;
-        if (!can_evict) {
-            for (const auto & entry : m_cache)
-                if (entry.second.users == 0) { can_evict = true; break; }
-        }
-        if (!can_evict) {
-            status = 409;
-            error = "LoRA cache is full and every adapter is in use";
-            return {};
-        }
 
         const std::string slot = "__breeze_lora_" + std::to_string(m_next_slot++);
         bool loaded = false;
@@ -233,6 +238,7 @@ void Models::release(const std::string & path, bool base) {
     if (it->second.users > 0) --it->second.users;
     it->second.last_used = now;
     m_last_used[path] = now;
+    m_available.notify_all();
 }
 
 void Models::unload_locked(const std::string & path, const Entry & entry) {

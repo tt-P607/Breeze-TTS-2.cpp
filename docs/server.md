@@ -341,17 +341,18 @@ long before generation finishes.
 | `400` | `{"error":"text is required"}` | `text` missing or empty. |
 | `403` | `{"error":"lora_path is restricted to localhost requests"}` | A request from another host supplied `lora_path`. |
 | `404` | `{"error":"unknown model_id"}` or `{"error":"unknown voice_id"}` | The model ID or reference voice is not registered. |
-| `409` | `{"error":"busy"}` | The execution mode is occupied, every generation slot is taken, or the LoRA cache is full and all entries are in use. |
 | `422` | `{"error":"failed to load LoRA adapter"}` | The selected adapter could not be loaded. |
 
 The server shares one base model. Requests default to `execution=serial`, which excludes
 other TTS generation requests until the whole HTTP response finishes. Set `execution=parallel`
 to allow overlap with other explicitly parallel requests. `--parallel` sets the GPU slot limit;
 a request using guidance takes two slots, see
-[performance.md](performance.md#running-several-streams). A request that does not
-fit is rejected immediately with `409` rather than queued, so clients should retry
-with backoff. Parallel requests may use different LoRAs; the scheduler groups frames by adapter. The WebSocket
-endpoint queues generation instead of refusing, which is useful for conversational clients.
+[performance.md](performance.md#running-several-streams). HTTP, WebSocket, batch items, and
+uncached reference encoding share one server-side FIFO queue. Requests wait for their turn
+and sufficient slots; clients need no local concurrency limit or busy-retry loop. A waiting
+serial request blocks later parallel requests from overtaking it. Parallel requests may use
+different LoRAs; the scheduler groups frames by adapter. A disconnected or cancelled waiter
+is removed without generating audio. Client timeouts must include queueing time.
 
 Because the response is streamed, a failure that happens **after** the first
 chunk cannot change the status code. The connection is closed early instead, so
@@ -510,7 +511,6 @@ instead of a bare status code.
 | `400` | The body is not a JSON object, `input` is missing, or a field has the wrong type or an invalid path. |
 | `403` | A request from another host supplied `lora_path`. |
 | `404` | `voice` is not saved or cached, or `model` is not registered. |
-| `409` | The execution mode is occupied, every generation slot is taken, or the LoRA cache is full and all entries are in use. |
 | `422` | The selected LoRA failed to load. |
 
 The `Authorization` header is ignored, so any API key works. That also means
@@ -543,7 +543,9 @@ Item IDs are optional and must be unique; omitted IDs are zero-based index strin
 Invalid syntax or voice settings reject the batch before generation. Model loading or generation
 failures are returned for the affected item as `status: "error"`, `status_code`, and `error`;
 other items continue. The default model is captured once when the batch is accepted.
-If another request occupies the execution mode, the batch returns HTTP `409`.
+Each item enters the shared server queue. Serial batches submit one item at a time;
+parallel batches submit up to the slot limit. Other clients may run between batch items,
+so a large batch does not reserve the service until all its audio has finished.
 
 The batch endpoint returns after all items finish. Its `first_audio_ms` measures internal
 generation timing, not when the caller receives audio. Use the single speech endpoint or

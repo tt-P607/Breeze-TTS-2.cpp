@@ -124,11 +124,11 @@ about 1 s for its first audio. With guidance in the mix, a burst was the one cas
 needed a client buffer: up to about 1 s of gaps with nothing buffered. The bundled UI
 already buffers 1.25 s.
 
-**When the slots are full.** The HTTP routes answer `409` straight away, and a
-WebSocket session sends `queued` and waits. Each WebSocket piece takes its slots
-separately, so sessions take turns between pieces. Voice conversion takes every slot,
-so it needs the server idle and blocks new streams until it finishes. Registering a
-voice runs between frames, so every stream waits for that encode, about 650 ms.
+**When the slots are full.** HTTP requests and batch items wait in the same backend
+FIFO as WebSocket pieces. WebSocket reports `queued` while waiting. A serial request
+runs alone and blocks later parallel requests from overtaking it. Voice conversion
+and uncached reference registration also wait for exclusive access; cached references
+return directly. Clients only submit, receive and cancel; they do not need a local queue.
 
 **The same seed gives different audio in a batch.** Each stream keeps its own random
 numbers, but GPU rounding differs slightly with the batch size and that can change what
@@ -256,5 +256,5 @@ the server idle.
 | Gaps only when several streams run | Too many streams for this card | Lower `--parallel` or use a smaller model |
 | Gaps only when requests start together | The burst case above | Buffer about 1 s, or space out the requests |
 | Slow first request, fine after that | Pipelines being built | Leave the warm up on, see above |
-| `409` from the HTTP routes | Every slot is taken | Raise `--parallel`, retry, or use the WebSocket, which waits |
+| A request waits before audio begins | Earlier work occupies the execution mode or slots | Allow queueing time in the client timeout; cancel requests no longer needed |
 | A run much slower than the last one | Other programs on the GPU | Check GPU load and run it again |
