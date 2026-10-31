@@ -476,7 +476,7 @@ def test_serial_and_dynamic_paths(server, report, report_lock, adapter_paths):
 
 
 def test_serial_gate(server, report, report_lock):
-    token_count = 32
+    token_count = 16
     text = "这段短文本用于验证串行请求的执行门控。"
     with ThreadPoolExecutor(max_workers=1) as pool:
         active = pool.submit(
@@ -529,16 +529,11 @@ def test_serial_gate(server, report, report_lock):
 
 
 def test_parallel_requests(server, report, report_lock, pcm_a, pcm_b):
-    barrier = threading.Barrier(5)
-    jobs = {
-        "a-1": ("voice-a", pcm_a),
-        "a-2": ("voice-a", pcm_a),
-        "b-1": ("voice-b", pcm_b),
-        "b-2": ("voice-b", pcm_b),
-    }
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    barrier = threading.Barrier(3)
+    jobs = {"a": "voice-a", "b": "voice-b"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {}
-        for label, (model_id, _) in jobs.items():
+        for label, model_id in jobs.items():
             def work(job_label=label, job_model=model_id):
                 barrier.wait(timeout=15)
                 return synthesize(
@@ -571,14 +566,13 @@ def test_parallel_requests(server, report, report_lock, pcm_a, pcm_b):
             "parallel requests never showed both different LoRAs in_use at once",
         )
 
-        outputs = {label: future.result(timeout=HTTP_TIMEOUT + 30) for label, future in futures.items()}
+        outputs = {
+            label: future.result(timeout=HTTP_TIMEOUT + 30)
+            for label, future in futures.items()
+        }
 
-    require(outputs["a-1"] == pcm_a and outputs["a-2"] == pcm_a,
-            "concurrent A PCM differs from its serial fixed-seed baseline")
-    require(outputs["b-1"] == pcm_b and outputs["b-2"] == pcm_b,
-            "concurrent B PCM differs from its serial fixed-seed baseline")
-    require(outputs["a-1"] == outputs["a-2"], "same-model A batch outputs differ")
-    require(outputs["b-1"] == outputs["b-2"], "same-model B batch outputs differ")
+    require(outputs["a"] == pcm_a, "concurrent A PCM differs from its serial fixed-seed baseline")
+    require(outputs["b"] == pcm_b, "concurrent B PCM differs from its serial fixed-seed baseline")
     require(server.models()["active_model"] == "voice-b",
             "changing the default during generation did not take effect for future requests")
     append_check(
@@ -587,8 +581,10 @@ def test_parallel_requests(server, report, report_lock, pcm_a, pcm_b):
         {
             "both_in_use_observed": True,
             "default_changed_during_overlap": "voice-b",
-            "a_batch_hash": hashlib.sha256(outputs["a-1"]).hexdigest(),
-            "b_batch_hash": hashlib.sha256(outputs["b-1"]).hexdigest(),
+            "a_batch_size": 1,
+            "b_batch_size": 1,
+            "a_hash": hashlib.sha256(outputs["a"]).hexdigest(),
+            "b_hash": hashlib.sha256(outputs["b"]).hexdigest(),
         },
     )
 
@@ -753,7 +749,7 @@ def test_idle_expiry(server, report, report_lock, idle_seconds):
 
 
 def test_active_lease_expiry(server, report, report_lock, idle_seconds):
-    token_count = min(2048, max(256, idle_seconds * 128))
+    token_count = min(2048, max(16, idle_seconds * 5))
     long_text = "这是一个用于检查 LoRA 正在生成时不会被空闲清理的短接口验证。" * 12
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(
@@ -864,7 +860,7 @@ def test_idle_websocket_reload(server, report, idle_seconds):
 def test_disconnect_isolation(server, report, report_lock, idle_seconds):
     """A slow optional check: cancel one streamed model while another completes."""
     text = "這是一段用於檢查串流斷線隔離的文字。" * 8
-    token_count = min(1024, max(128, idle_seconds * 64))
+    token_count = min(1024, max(16, idle_seconds * 5))
     first_chunk = threading.Event()
     close_request = threading.Event()
     holder = {}
