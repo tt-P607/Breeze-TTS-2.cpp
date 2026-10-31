@@ -1,5 +1,6 @@
 #include "breeze/depth_decoder.h"
 #include "breeze/backbone.h"
+#include "breeze/scheduler.h"
 
 #include <cmath>
 #include <cstdio>
@@ -28,49 +29,65 @@ static void scratch_graph(Backend & be) {
     require(tensor_to_f32(out).front() == 9.0f, "temporary graph failed");
 }
 
-static void test_lora_projection(BreezeModel & m) {
-    const std::string base_name = "bb.blk.0.attn_q.weight";
-    ggml_tensor * base = m.w(base_name);
+static std::unique_ptr<LoraAdapter> projection_adapter(BreezeModel & m, const std::string & name, float gain) {
     auto adapter = std::make_unique<LoraAdapter>();
     adapter->scale = 0.5f;
-
+    ggml_tensor * base = m.w(name);
     ggml_init_params params{ggml_tensor_overhead() * 2 + 4096, nullptr, true};
     adapter->gg.meta = ggml_init(params);
     require(adapter->gg.meta != nullptr, "LoRA test context allocation failed");
-    ggml_tensor * a = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F32, base->ne[0], 1);
-    ggml_tensor * b = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F32, 1, base->ne[1]);
-    const std::string a_name = base_name + ".lora_a";
-    const std::string b_name = base_name + ".lora_b";
-    ggml_set_name(a, a_name.c_str());
-    ggml_set_name(b, b_name.c_str());
-    adapter->gg.tensors.emplace(a_name, a);
-    adapter->gg.tensors.emplace(b_name, b);
+    auto * a = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F32, base->ne[0], 1);
+    auto * b = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F32, 1, base->ne[1]);
+    adapter->gg.tensors.emplace(name + ".lora_a", a);
+    adapter->gg.tensors.emplace(name + ".lora_b", b);
     adapter->gg.buffer = ggml_backend_alloc_ctx_tensors(adapter->gg.meta, m.backend.backend);
     require(adapter->gg.buffer != nullptr, "LoRA test buffer allocation failed");
-
     std::vector<float> av(base->ne[0], 0.0f), bv(base->ne[1], 0.0f);
     av[0] = 1.0f;
-    bv[0] = 2.0f;
+    bv[0] = gain;
     ggml_backend_tensor_set(a, av.data(), 0, av.size() * sizeof(float));
     ggml_backend_tensor_set(b, bv.data(), 0, bv.size() * sizeof(float));
-    m.loras.emplace("test-lora", std::move(adapter));
+    return adapter;
+}
 
-    std::vector<float> input(base->ne[0], 0.25f);
+static void test_lora_projection(BreezeModel & m) {
+    const std::string name = "bb.blk.0.attn_q.weight";
+    m.loras.emplace("voice-a", projection_adapter(m, name, 2.0f));
+    m.loras.emplace("voice-b", projection_adapter(m, name, -4.0f));
+    std::vector<float> input(m.w(name)->ne[0], 0.25f);
     input[0] = 3.0f;
-    Graph base_graph(64);
-    ggml_tensor * x = base_graph.input_f32(input, (int) base->ne[0]);
-    ggml_tensor * base_out = m.project(base_graph.ctx, base_name, x);
-    base_graph.compute(m.backend, base_out);
-    std::vector<float> expected = tensor_to_f32(base_out);
-    expected[0] += input[0];
-
-    require(m.set_lora("test-lora"), "LoRA selection failed");
-    Graph lora_graph(64);
-    x = lora_graph.input_f32(input, (int) base->ne[0]);
-    ggml_tensor * actual = m.project(lora_graph.ctx, base_name, x);
-    lora_graph.compute(m.backend, actual);
-    close(tensor_to_f32(actual), expected);
-    m.clear_lora();
+    const auto project = [&](const std::string & id) {
+        ScopedLora selected(m, id);
+        Graph g(64);
+        auto * x = g.input_f32(input, (int) input.size());
+        auto * out = m.project(g.ctx, name, x);
+        g.compute(m.backend, out);
+        return tensor_to_f32(out);
+    };
+    const auto base = project("");
+    auto expected_a = base, expected_b = base;
+    expected_a[0] += 3.0f;
+    expected_b[0] -= 6.0f;
+    for (int round = 0; round < 3; round++) {
+        close(project("voice-a"), expected_a);
+        close(project("voice-b"), expected_b);
+        close(project(""), base);
+        require(m.active_lora == nullptr, "LoRA leaked outside its request scope");
+    }
+    {
+        ScopedLora a(m, "voice-a");
+        close(project("voice-b"), expected_b);
+        require(m.active_lora == m.loras.at("voice-a").get(), "nested LoRA scope did not restore its caller");
+    }
+    GenScheduler scheduler;
+    scheduler.start(m, 4);
+    require(&scheduler.pool("voice-a") != &scheduler.pool("voice-b"), "adapters share a generation pool");
+    require(&scheduler.pool("voice-a") == &scheduler.pool("voice-a"), "adapter pool was not reused");
+    scheduler.exec([&] { scheduler.unload_lora("voice-a"); });
+    require(!m.loras.count("voice-a"), "idle adapter was not unloaded");
+    close(project("voice-b"), expected_b);
+    scheduler.stop();
+    m.unload_lora("voice-b");
 }
 
 static void test_graph(Backend & be) {

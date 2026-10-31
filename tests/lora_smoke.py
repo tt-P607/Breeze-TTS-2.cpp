@@ -127,6 +127,11 @@ class ServerProcess:
             str(idle_seconds),
             "--parallel",
             str(self.args.parallel),
+            # Keep packet boundaries fixed when comparing PCM across adapter schedules.
+            "--chunk-first",
+            "1",
+            "--chunk-max",
+            "1",
         ]
         for model_id, adapter_path in self.adapters.items():
             command.extend(("--switchable-lora", f"{model_id}={adapter_path}"))

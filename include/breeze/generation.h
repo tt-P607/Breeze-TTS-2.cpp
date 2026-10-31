@@ -16,6 +16,7 @@
 namespace breeze {
 
 struct GenRequest {
+    std::string lora_id; // internal adapter slot, empty selects the base weights
     std::string text;
     std::string instruction = "Speak clearly and naturally.";
     std::string ref_text;
@@ -188,6 +189,7 @@ public:
     bool speak(const std::string & text, const AudioCallback & cb, GenTimings * tm = nullptr);
 
     void set_instruction(const std::string & s) { m_req.instruction = s; }
+    void set_lora(const std::string & id) { m_req.lora_id = id; }
 
     // with no clip to clone the first piece becomes the reference, so it wants to stay short
     bool needs_anchor() const { return m_codes.empty(); }

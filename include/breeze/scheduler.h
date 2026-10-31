@@ -9,6 +9,8 @@
 #include <exception>
 #include <functional>
 #include <list>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -23,7 +25,9 @@ public:
     void start(BreezeModel & m, int parallel);
     void stop();
     int parallel() const { return m_parallel; }
-    GenPool & pool() { return m_pool; }
+    GenPool & pool(const std::string & lora_id = "");
+    // Called on the GPU thread only, after all requests have released the adapter.
+    void unload_lora(const std::string & lora_id);
 
     // a request holds slots for as long as it generates, try fails when too few are free
     bool try_acquire(int n = 1);
@@ -61,6 +65,8 @@ private:
 
     BreezeModel * m_model = nullptr;
     GenPool m_pool;
+    std::mutex m_pool_mu;
+    std::map<std::string, std::unique_ptr<GenPool>> m_lora_pools;
     int m_parallel = 1;
 
     std::mutex m_slot_mu;

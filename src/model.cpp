@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <stdexcept>
 #include <utility>
 
 namespace breeze {
@@ -82,6 +83,16 @@ bool BreezeModel::set_lora(const std::string & id) {
     if (it == loras.end()) return false;
     active_lora = it->second.get();
     return true;
+}
+
+ScopedLora::ScopedLora(BreezeModel & model, const std::string & id)
+    : model(model), previous(model.active_lora) {
+    if (id.empty()) model.clear_lora();
+    else if (!model.set_lora(id)) throw std::runtime_error("unknown LoRA slot: " + id);
+}
+
+ScopedLora::~ScopedLora() {
+    model.active_lora = previous;
 }
 
 void BreezeModel::unload_lora(const std::string & id) {

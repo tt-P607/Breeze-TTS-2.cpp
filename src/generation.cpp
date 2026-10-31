@@ -118,6 +118,7 @@ static int first_chunk(const GenPool & pool, int rows, double frame_audio_ms) {
 }
 
 void SpeechJob::start(int other_rows) {
+    const ScopedLora selected(m, req.lora_id);
     const bool has_ref = !ref.codes.empty() && !ref.text.empty();
     use_cfg = req.cfg_scale != 1.0f;
 
@@ -239,6 +240,8 @@ void SpeechJob::finish() {
 }
 
 void step_jobs(BreezeModel & m, GenPool & pool, const std::vector<SpeechJob *> & jobs) {
+    if (jobs.empty()) return;
+    const ScopedLora selected(m, jobs.front()->req.lora_id);
     const auto t_step = std::chrono::steady_clock::now();
     int step_rows = 0;
     for (SpeechJob * j : jobs) {
@@ -355,7 +358,7 @@ bool GenSession::speak(const std::string & text, const AudioCallback & cb, GenTi
     anchor.n_frames = m_frames;
     anchor.text = m_text;
 
-    SpeechJob job(*m_model, m_sched ? m_sched->pool() : m_pool, m_req, text, std::move(anchor),
+    SpeechJob job(*m_model, m_sched ? m_sched->pool(m_req.lora_id) : m_pool, m_req, text, std::move(anchor),
                   (uint32_t) m_req.seed + m_piece, cb, t, m_start, m_clock);
     bool ok;
     if (m_sched) {

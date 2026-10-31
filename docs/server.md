@@ -350,7 +350,7 @@ to allow overlap with other explicitly parallel requests. `--parallel` sets the 
 a request using guidance takes two slots, see
 [performance.md](performance.md#running-several-streams). A request that does not
 fit is rejected immediately with `409` rather than queued, so clients should retry
-with backoff. Parallel requests may use different LoRAs in the same scheduling batch. The WebSocket
+with backoff. Parallel requests may use different LoRAs; the scheduler groups frames by adapter. The WebSocket
 endpoint queues generation instead of refusing, which is useful for conversational clients.
 
 Because the response is streamed, a failure that happens **after** the first
@@ -519,7 +519,7 @@ there is still no authentication, see the warning above.
 ## Batch requests
 
 `POST /v1/audio/speech/batch` accepts JSON with one `execution` mode and an `items` array.
-Each item uses the OpenAI speech fields such as `input`, `model`, `voice`, `response_format`,
+Submit between 1 and 16 items. Each item uses the OpenAI speech fields such as `input`, `model`, `voice`, `response_format`,
 and `lora_path`; the top-level mode applies to the whole batch, so items do not set `execution`.
 The default is serial. Explicit parallel mode may run items concurrently, subject to the
 server's `--parallel` slot limit and available LoRA cache capacity.
@@ -534,9 +534,20 @@ server's `--parallel` slot limit and available LoRA cache capacity.
 }
 ```
 
-The JSON response contains `results` in input order. Each result reports its `id`, `model`,
-`status`, `format`, `sample_rate`, and `audio_base64`. The batch endpoint does not multiplex
-streaming audio; use the single speech endpoint for streamed playback.
+The JSON response contains `execution`, `elapsed_ms`, and `results` in input order.
+Successful results report `id`, `model`, `status: "ok"`, `format: "wav"`, `sample_rate`,
+`first_audio_ms`, `wall_ms`, `duration_seconds`, and `audio_base64`. Decode `audio_base64`
+to get a complete WAV file. Output is always WAV; omit `response_format` or set it to `wav`.
+Item IDs are optional and must be unique; omitted IDs are zero-based index strings.
+
+Invalid syntax or voice settings reject the batch before generation. Model loading or generation
+failures are returned for the affected item as `status: "error"`, `status_code`, and `error`;
+other items continue. The default model is captured once when the batch is accepted.
+If another request occupies the execution mode, the batch returns HTTP `409`.
+
+The batch endpoint returns after all items finish. Its `first_audio_ms` measures internal
+generation timing, not when the caller receives audio. Use the single speech endpoint or
+WebSocket for streamed playback. This endpoint does not mix the resulting audio files.
 
 ### SillyTavern
 

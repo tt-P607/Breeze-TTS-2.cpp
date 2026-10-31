@@ -23,6 +23,23 @@ void GenScheduler::stop() {
         m_thread.join();
     }
     m_pool.free();
+    m_lora_pools.clear();
+}
+
+GenPool & GenScheduler::pool(const std::string & lora_id) {
+    if (lora_id.empty()) return m_pool;
+    std::lock_guard<std::mutex> lock(m_pool_mu);
+    auto & entry = m_lora_pools[lora_id];
+    if (!entry) entry = std::make_unique<GenPool>();
+    return *entry;
+}
+
+void GenScheduler::unload_lora(const std::string & lora_id) {
+    {
+        std::lock_guard<std::mutex> lock(m_pool_mu);
+        m_lora_pools.erase(lora_id);
+    }
+    m_model->unload_lora(lora_id);
 }
 
 bool GenScheduler::try_acquire(int n) {
@@ -163,23 +180,33 @@ void GenScheduler::loop() {
             }
         }
 
-        std::vector<SpeechJob *> batch;
+        std::map<std::string, std::vector<SpeechJob *>> batches;
         for (Entry * e : m_active) {
             if (e->cancel) e->job->stopped = true;
-            if (e->job->wants_frame()) batch.push_back(e->job);
+            if (e->job->wants_frame()) batches[e->job->req.lora_id].push_back(e->job);
         }
-        std::exception_ptr failed;
-        if (!batch.empty()) {
+        std::map<std::string, std::exception_ptr> failed;
+        const auto frame_start = std::chrono::steady_clock::now();
+        for (const auto & batch : batches) {
             try {
-                step_jobs(*m_model, m_pool, batch);
+                step_jobs(*m_model, pool(batch.first), batch.second);
             } catch (...) {
-                failed = std::current_exception();
+                failed[batch.first] = std::current_exception();
             }
+        }
+        if (batches.size() > 1) {
+            // Each listener also waits while the other adapters take their turn.
+            const double elapsed = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - frame_start).count();
+            for (const auto & batch : batches)
+                for (SpeechJob * job : batch.second)
+                    job->clock.frame_ms = std::max(job->clock.frame_ms, elapsed - job->voc_step_ms);
         }
         for (auto it = m_active.begin(); it != m_active.end();) {
             Entry * e = *it;
-            if (failed || !e->job->wants_frame()) {
-                finish(*e, failed);
+            const auto error = failed.find(e->job->req.lora_id);
+            if (error != failed.end() || !e->job->wants_frame()) {
+                finish(*e, error == failed.end() ? nullptr : error->second);
                 it = m_active.erase(it);
             } else {
                 ++it;
@@ -190,6 +217,7 @@ void GenScheduler::loop() {
 
 void GenScheduler::warm_up(const GenRequest & base) {
     exec([&] {
+        GenPool & selected_pool = pool(base.lora_id);
         GenRequest plain = base;
         plain.text = warm_up_text();
         plain.instruction = GenRequest().instruction;
@@ -205,7 +233,7 @@ void GenScheduler::warm_up(const GenRequest & base) {
             std::deque<SpeechJob> jobs;
             std::vector<SpeechJob *> all;
             for (int s = 0; s < n_plain + n_cfg; s++) {
-                jobs.emplace_back(*m_model, m_pool, s < n_plain ? plain : guided, plain.text, ChunkRef(), (uint32_t) s,
+                jobs.emplace_back(*m_model, selected_pool, s < n_plain ? plain : guided, plain.text, ChunkRef(), (uint32_t) s,
                                   drop, tm, std::chrono::steady_clock::now(), clock);
                 jobs.back().start();
                 all.push_back(&jobs.back());
@@ -215,7 +243,7 @@ void GenScheduler::warm_up(const GenRequest & base) {
                 for (SpeechJob * j : all)
                     if (j->wants_frame()) live.push_back(j);
                 if (live.empty()) break;
-                step_jobs(*m_model, m_pool, live);
+                step_jobs(*m_model, selected_pool, live);
             }
             for (SpeechJob * j : all) j->finish();
         };

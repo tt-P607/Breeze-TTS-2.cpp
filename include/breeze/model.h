@@ -39,4 +39,17 @@ struct BreezeModel {
     ggml_tensor * project(ggml_context * ctx, const std::string & weight_name, ggml_tensor * x) const;
 };
 
+// Generation runs on the scheduler thread; a scope selects only that job's adapter.
+class ScopedLora {
+public:
+    ScopedLora(BreezeModel & model, const std::string & id);
+    ~ScopedLora();
+    ScopedLora(const ScopedLora &) = delete;
+    ScopedLora & operator=(const ScopedLora &) = delete;
+
+private:
+    BreezeModel & model;
+    LoraAdapter * previous;
+};
+
 }

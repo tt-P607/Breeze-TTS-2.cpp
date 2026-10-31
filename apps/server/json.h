@@ -5,6 +5,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace breeze {
 
@@ -14,6 +15,7 @@ struct JVal {
     double num = 0;
     std::string str;
     std::map<std::string, JVal> obj;
+    std::vector<JVal> arr;
 };
 
 // python sends non ascii as \u escapes by default, so this has to decode them properly
@@ -86,6 +88,7 @@ private:
 
     bool array(JVal & v, int depth) {
         v.kind = JVal::Arr;
+        v.arr.clear();
         m_i++;
         ws();
         if (eat(']')) return true;
@@ -93,6 +96,7 @@ private:
             ws();
             JVal child;
             if (!value(child, depth + 1)) return false;
+            v.arr.push_back(std::move(child));
             ws();
             if (eat(',')) continue;
             return eat(']');
