@@ -132,7 +132,7 @@ target_link_libraries(breeze-quantize PRIVATE breeze_core)
 breeze_utf8(breeze-quantize)
 
 if(BREEZE_BUILD_SERVER)
-    add_executable(breeze-server apps/server/main.cpp apps/server/server.cpp apps/server/voices.cpp
+    add_executable(breeze-server apps/server/main.cpp apps/server/server.cpp apps/server/models.cpp apps/server/batch.cpp apps/server/voices.cpp
                                  apps/server/ws.cpp apps/server/ws_api.cpp apps/server/openai.cpp
                                  apps/server/encode.cpp)
     add_dependencies(breeze-server breeze_webui)

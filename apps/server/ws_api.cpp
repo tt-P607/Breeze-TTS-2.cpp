@@ -9,7 +9,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
-#include <shared_mutex>
+#include <exception>
 #include <thread>
 
 namespace breeze {
@@ -33,6 +33,11 @@ static std::string esc(const std::string & s) {
         else o += c;
     }
     return o;
+}
+
+static bool loopback_peer(const std::string & address) {
+    return address == "127.0.0.1" || address.rfind("127.", 0) == 0 ||
+           address == "::1" || address == "localhost";
 }
 
 static bool sentence_end(const std::string & s, size_t i) {
@@ -92,11 +97,28 @@ struct Session {
     std::string instruction = "Speak clearly and naturally.";
     int budget = 600;
     int cost = 1;
+    bool parallel_execution = false;
+    Models::Selection selection;
+    bool selection_registration_pending = false;
     bool started = false;
     bool ending = false;
     bool quit = false;
     bool speaking = false;
     std::atomic<bool> cancel{false};
+};
+
+struct SlotHold {
+    GenScheduler & sched;
+    int n;
+    bool held = true;
+
+    SlotHold(GenScheduler & scheduler, int count) : sched(scheduler), n(count) {}
+    ~SlotHold() { release(); }
+    void release() {
+        if (!held) return;
+        sched.release(n);
+        held = false;
+    }
 };
 
 } // namespace
@@ -106,9 +128,13 @@ static void event(WsConn & c, const std::string & type, const std::string & extr
 }
 
 // drains the queue one piece at a time, taking a slot for each so other connections interleave
-static void speaker(WsConn & conn, Session & s, GenScheduler & sched) {
+static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & models,
+                    std::shared_mutex & execution_gate) {
     for (;;) {
         Piece piece;
+        Models::Selection selected;
+        bool register_id = false;
+        bool parallel_execution = false;
         {
             std::unique_lock<std::mutex> lock(s.mu);
             s.speaking = false;
@@ -124,29 +150,94 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched) {
             piece = std::move(s.queue.front());
             s.queue.pop_front();
             s.speaking = true;
+            selected = s.selection;
+            register_id = s.selection_registration_pending;
+            parallel_execution = s.parallel_execution;
         }
-        if (s.cancel) { s.cancel = false; continue; }
+        if (s.cancel) {
+            s.cancel = false;
+            event(conn, "cancelled");
+            continue;
+        }
+
+        RequestExecution permit(execution_gate, parallel_execution, true);
+        if (s.cancel) {
+            s.cancel = false;
+            event(conn, "cancelled");
+            continue;
+        }
+        if (!conn.alive()) return;
 
         if (!sched.try_acquire(s.cost)) {
             event(conn, "queued");
             sched.acquire(s.cost);
         }
-        if (s.cancel) { sched.release(s.cost); s.cancel = false; continue; }
+        SlotHold slot(sched, s.cost);
+        if (s.cancel) {
+            s.cancel = false;
+            event(conn, "cancelled");
+            continue;
+        }
+        if (!conn.alive()) return;
+
+        selected.register_id = register_id;
+        int status = 0;
+        std::string error;
+        std::shared_ptr<Models::Lease> lease;
+        try {
+            lease = models.acquire(selected, status, error);
+        } catch (const std::exception & e) {
+            error = e.what();
+        } catch (...) {
+            error = "failed to acquire LoRA adapter";
+        }
+        if (!lease) {
+            (void) status;
+            event(conn, "error", "\"message\":\"" + esc(error) + "\"");
+            continue;
+        }
+        if (s.cancel) {
+            lease.reset();
+            event(conn, "cancelled");
+            s.cancel = false;
+            continue;
+        }
+        if (!conn.alive()) {
+            lease.reset();
+            return;
+        }
+        if (register_id) {
+            std::lock_guard<std::mutex> lock(s.mu);
+            s.selection_registration_pending = false;
+        }
 
         {
             std::lock_guard<std::mutex> lock(s.mu);
             s.gen.set_instruction(piece.instruction);
+            s.gen.set_lora(lease->slot());
         }
         event(conn, "speaking", "\"text\":\"" + esc(piece.text) + "\"");
 
-        int sent = 0;
-        const bool ok = s.gen.speak(piece.text, [&](const float * a, int n) {
-            if (s.cancel || !conn.alive()) return false;
-            std::vector<uint8_t> pcm = to_pcm16(a, n);
-            sent += n;
-            return conn.send_binary(pcm.data(), pcm.size());
-        });
-        sched.release(s.cost);
+        bool ok = false;
+        try {
+            ok = s.gen.speak(piece.text, [&](const float * a, int n) {
+                if (s.cancel || !conn.alive()) return false;
+                std::vector<uint8_t> pcm = to_pcm16(a, n);
+                return conn.send_binary(pcm.data(), pcm.size());
+            });
+        } catch (const std::exception & e) {
+            fprintf(stderr, "websocket generation error: %s\n", e.what());
+            event(conn, "error", "\"message\":\"generation failed\"");
+            lease.reset();
+            continue;
+        } catch (...) {
+            fprintf(stderr, "websocket generation error: unknown exception\n");
+            event(conn, "error", "\"message\":\"generation failed\"");
+            lease.reset();
+            continue;
+        }
+        lease.reset();
+        slot.release();
 
         if (s.cancel) { event(conn, "cancelled"); s.cancel = false; continue; }
         if (!ok && !conn.alive()) return;
@@ -160,8 +251,49 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched) {
 }
 
 static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeModel & model,
-                         MimiCodec & codec, VoiceStore & store, GenScheduler & sched, int chunk_first,
+                         MimiCodec & codec, VoiceStore & store, GenScheduler & sched, Models & models,
+                         int chunk_first,
                          int chunk_max, int split_chars) {
+    if (s.started) {
+        event(conn, "error", "\"message\":\"start was already received for this connection\"");
+        return;
+    }
+    const auto optional_string = [&](const char * key, bool & present, std::string & value) {
+        const auto it = msg.obj.find(key);
+        present = it != msg.obj.end();
+        if (!present) return true;
+        if (it->second.kind != JVal::Str || it->second.str.empty()) return false;
+        value = it->second.str;
+        return true;
+    };
+    bool has_id = false, has_path = false;
+    std::string model_id, lora_path;
+    if (!optional_string("model_id", has_id, model_id) || !optional_string("lora_path", has_path, lora_path)) {
+        event(conn, "error", "\"message\":\"model_id and lora_path must be nonempty strings\"");
+        return;
+    }
+    bool parallel_execution = false;
+    const auto execution = msg.obj.find("execution");
+    if (execution != msg.obj.end()) {
+        if (execution->second.kind != JVal::Str ||
+            (execution->second.str != "serial" && execution->second.str != "parallel")) {
+            event(conn, "error", "\"message\":\"execution must be serial or parallel\"");
+            return;
+        }
+        parallel_execution = execution->second.str == "parallel";
+    }
+    if (has_path && !loopback_peer(conn.remote_addr())) {
+        event(conn, "error", "\"message\":\"lora_path is restricted to localhost requests\"");
+        return;
+    }
+    Models::Selection selection;
+    int status = 0;
+    std::string error;
+    if (!models.select(has_id, model_id, has_path, lora_path, selection, status, error)) {
+        event(conn, "error", "\"message\":\"" + esc(error) + "\"");
+        return;
+    }
+
     GenRequest g;
     g.instruction = json_str(msg, "instruction");
     if (g.instruction.empty()) g.instruction = "Speak clearly and naturally.";
@@ -170,6 +302,7 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
     g.seed = (int) json_num(msg, "seed", 42);
     g.temperature = (float) json_num(msg, "temperature", 0);
     g.top_k = (int) json_num(msg, "top_k", 0);
+    g.max_new_tokens = (int) json_num(msg, "max_new_tokens", 0);
     g.chunk_first = chunk_first;
     g.chunk_max = chunk_max;
 
@@ -182,6 +315,9 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
     std::lock_guard<std::mutex> lock(s.mu);
     s.instruction = g.instruction;
     s.cost = sched.cost(g.cfg_scale);
+    s.parallel_execution = parallel_execution;
+    s.selection = std::move(selection);
+    s.selection_registration_pending = s.selection.register_id;
     s.budget = (int) json_num(msg, "split_chars", split_chars);
     // streaming drains sentence by sentence, so it always needs a real budget to aim at
     if (s.budget <= 0) s.budget = 600;
@@ -194,15 +330,11 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
 }
 
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
-                   GenScheduler & sched, std::shared_mutex & model_gate,
+                   GenScheduler & sched, Models & models,
+                   std::shared_mutex & execution_gate,
                    int chunk_first, int chunk_max, int split_chars) {
-    std::shared_lock<std::shared_mutex> model_lock(model_gate, std::try_to_lock);
-    if (!model_lock) {
-        event(conn, "error", "\"message\":\"model_switching\"");
-        return;
-    }
     Session s;
-    std::thread worker([&] { speaker(conn, s, sched); });
+    std::thread worker([&] { speaker(conn, s, sched, models, execution_gate); });
     event(conn, "ready", "\"sample_rate\":24000,\"format\":\"s16le\"");
 
     std::string raw;
@@ -217,7 +349,8 @@ void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceS
         const std::string type = json_str(msg, "type");
 
         if (type == "start") {
-            handle_start(conn, s, msg, model, codec, store, sched, chunk_first, chunk_max, split_chars);
+            handle_start(conn, s, msg, model, codec, store, sched, models,
+                         chunk_first, chunk_max, split_chars);
             continue;
         }
         if (!s.started) {

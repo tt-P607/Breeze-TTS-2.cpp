@@ -1,7 +1,9 @@
 #include "ws.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -9,6 +11,7 @@
 using socklen_t = int;
 #define BRZ_BAD INVALID_SOCKET
 #define brz_close closesocket
+#define brz_shutdown(s) shutdown((SOCKET) (s), SD_BOTH)
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -18,6 +21,7 @@ using socklen_t = int;
 using SOCKET = int;
 #define BRZ_BAD (-1)
 #define brz_close ::close
+#define brz_shutdown(s) shutdown((SOCKET) (s), SHUT_RDWR)
 #endif
 
 namespace breeze {
@@ -111,7 +115,7 @@ bool WsConn::send(int opcode, const void * data, size_t n) {
     size_t off = 0;
     while (off < f.size()) {
         const int put = ::send((SOCKET) m_sock, (const char *) f.data() + off, (int) (f.size() - off), 0);
-        if (put <= 0) { m_closed = true; return false; }
+        if (put <= 0) return false;
         off += (size_t) put;
     }
     return true;
@@ -193,9 +197,19 @@ bool WsServer::start(const std::string & host, int port, Handler h) {
 }
 
 void WsServer::stop() {
-    if (!m_running.exchange(false)) return;
-    brz_close((SOCKET) m_listen);
+    const bool was_running = m_running.exchange(false);
+    if (was_running) {
+        brz_shutdown(m_listen);
+        brz_close((SOCKET) m_listen);
+        m_listen = 0;
+    }
     if (m_thread.joinable()) m_thread.join();
+    {
+        std::lock_guard<std::mutex> lock(m_connections_mutex);
+        for (uint64_t sock : m_connections) brz_shutdown(sock);
+    }
+    std::unique_lock<std::mutex> lock(m_connections_mutex);
+    m_connections_cv.wait(lock, [this] { return m_connections.empty(); });
 }
 
 // reads the upgrade request and answers it, leaving the socket talking websocket
@@ -234,12 +248,33 @@ void WsServer::accept_loop() {
         if (c == BRZ_BAD) break;
         int yes = 1;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char *) &yes, sizeof yes);
-        std::thread([this, c] {
+        {
+            std::lock_guard<std::mutex> lock(m_connections_mutex);
+            m_connections.push_back((uint64_t) c);
+        }
+        char ip[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+        std::thread([this, c, remote_addr = std::string(ip)] {
             if (handshake(c)) {
-                WsConn conn((uint64_t) c);
-                m_handler(conn);
+                WsConn conn((uint64_t) c, remote_addr);
+                try {
+                    m_handler(conn);
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "websocket connection error: %s\n", e.what());
+                } catch (...) {
+                    fprintf(stderr, "websocket connection error: unknown exception\n");
+                }
+                std::lock_guard<std::mutex> lock(m_connections_mutex);
+                conn.close();
+                m_connections.erase(std::remove(m_connections.begin(), m_connections.end(), (uint64_t) c),
+                                    m_connections.end());
+                m_connections_cv.notify_all();
             } else {
+                std::lock_guard<std::mutex> lock(m_connections_mutex);
                 brz_close(c);
+                m_connections.erase(std::remove(m_connections.begin(), m_connections.end(), (uint64_t) c),
+                                    m_connections.end());
+                m_connections_cv.notify_all();
             }
         }).detach();
     }

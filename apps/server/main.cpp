@@ -14,7 +14,7 @@ int main(int argc, char ** argv) {
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
         printf("usage: breeze-server <model.gguf> [--model-id ID]\n");
         printf("                     [--switchable-lora ID=PATH]...\n");
-        printf("                     [--lora-cache-size N]\n");
+        printf("                     [--lora-cache-size N] [--lora-idle-seconds N]\n");
         printf("                     [--host H] [--port P] [--webui] [--cpu]\n");
         printf("                     [--chunk-first N] [--chunk-max N] [--verbose]\n");
         printf("                     [--voices-dir PATH] [--ws-port P] [--split-chars N]\n");
@@ -29,8 +29,9 @@ int main(int argc, char ** argv) {
         printf("  --verbose      add a per stage timing breakdown to each request\n");
         printf("  --voices-dir   folder of saved .breeze voices to load at startup (default voices)\n");
         printf("  --model-id     ID of the initially loaded model (default default)\n");
-        printf("  --switchable-lora ID=PATH   register a LoRA adapter loaded on selection; repeatable\n");
-        printf("  --lora-cache-size N          maximum resident LoRA adapters (default 1)\n");
+        printf("  --switchable-lora ID=PATH   register a LoRA adapter loaded on request; repeatable\n");
+        printf("  --lora-cache-size N          maximum resident LoRA adapters (default 6)\n");
+        printf("  --lora-idle-seconds N        unload adapters after this many idle seconds (default 900)\n");
         printf("  --ws-port      websocket port for streaming sessions, default is the http port + 1,\n");
         printf("                 -1 turns it off\n");
         printf("  --cors         let browser pages on other origins call the api. on its own it allows\n");
@@ -81,6 +82,17 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             opts.lora_cache_size = static_cast<int>(count);
+        }
+        else if (a == "--lora-idle-seconds" && i + 1 < argc) {
+            const char * value = argv[++i];
+            char * end = nullptr;
+            errno = 0;
+            const long seconds = std::strtol(value, &end, 10);
+            if (errno || end == value || *end != '\0' || seconds < 1 || seconds > INT_MAX) {
+                fprintf(stderr, "--lora-idle-seconds requires a positive integer\n");
+                return 1;
+            }
+            opts.lora_idle_seconds = static_cast<int>(seconds);
         }
         else if (a == "--webui") opts.webui = true;
         else if (a == "--verbose" || a == "-v") opts.verbose = true;

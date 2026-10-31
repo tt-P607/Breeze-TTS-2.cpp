@@ -8,7 +8,6 @@
 
 #include <map>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -46,7 +45,7 @@ public:
     void put(const std::string & id, CachedVoice v);
 
     void add_routes(httplib::Server & svr, BreezeModel & model, MimiCodec & codec, GenScheduler & sched,
-                    std::shared_mutex & model_gate, const std::string & dir);
+                    const std::string & dir);
 
 private:
     std::map<std::string, CachedVoice> m_voices;

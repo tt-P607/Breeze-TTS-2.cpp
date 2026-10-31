@@ -4,9 +4,10 @@
 
 | 选择 | 控制什么 | 如何设置 |
 | --- | --- | --- |
-| 模型 ID | 使用底模，或叠加哪份 LoRA 权重 | `POST /v1/models/active` 的 `model_id` |
+| 模型 ID | 本次请求使用底模，或叠加哪份 LoRA 权重 | 原生表单用 `model_id`，OpenAI JSON 用 `model`，WebSocket `start` 用 `model_id` |
 | 音色 ID（`voice_id`） | 使用哪段参考录音及其文字 | 上传到 `POST /v1/voices` 后取得 |
 | 语气指令（`instruction`） | 这一段怎样说，例如温柔、耳语、惊喜 | 合成请求或 WebSocket 的 `instruction` 消息 |
+| 执行模式 | 请求串行执行，或允许与其他显式并行请求重叠 | HTTP 表单/JSON 或 WebSocket `start` 的 `execution`，默认 `serial` |
 
 LoRA 学习说话人的特点，参考音频提供本次合成的声音样本。两者可以一起使用。
 `voice_id` 是服务给参考音频缓存起的名字，不是模型文件，也不是 LoRA ID。
@@ -61,25 +62,26 @@ CFG 是整次请求或整个 WebSocket 会话的设置，`instruction` 消息只
 
 ## Bot 的一次完整请求
 
-单个服务同一时刻只有一个活动模型。`--parallel` 可以并行处理同一模型的请求；
-要在不同模型间切换时，Bot 的全局队列应覆盖以下整个流程：
+单个服务共享一份底模，每个请求可以单独选择 LoRA。请求默认串行；只有设置 `execution="parallel"` 才会与其他显式并行请求重叠。
+`--parallel` 仍限制 GPU 同时可用的生成槽位；
+没有显式模型字段时，服务使用当前默认模型。`POST /v1/models/active` 只修改后续省略模型字段的请求，
+不会切换正在运行的请求或已开始的 WebSocket 会话。
 
-1. 轮到请求后读取并选择 `model_id`；已经是该模型时，服务返回 `changed=false`。
+1. 在合成请求或 WebSocket `start` 中带上 `model_id`；OpenAI JSON 使用标准 `model` 字段。需要并行时显式设置 `execution="parallel"`。
 2. 按该模型的配置取得参考 WAV 和准确文字，上传到 `POST /v1/voices`，保存返回的 `id`。
 3. 从 `GET /health` 的 `ws_port` 取得 WebSocket 端口，连接后等待 `ready`。
 4. 发送 `start`，携带 `voice_id`、整次请求的 CFG 和随机种子，等待 `started`。
 5. 按顺序发送各段 `instruction` 和 `flush`；接收二进制 PCM，同时处理文本事件。
-6. 发送 `end`，一直接收到 `done`，再关闭连接，释放全局队列给下一个请求。
+6. 发送 `end`，一直接收到 `done`，再关闭连接。
 
-队列等待只发生在 Bot 侧。后端的 HTTP 合成和模型切换遇忙会返回 `409`；
-WebSocket 的音频生成可以等待 GPU，并发送 `queued`。
-打开的 WebSocket 会话会固定当前模型，因此切换前需要结束并关闭上一条连接。
-两个聊天流请求不同模型时，应完整执行完前一个请求，再切换并处理下一个。
+WebSocket 的音频生成可以等待 GPU，并发送 `queued`。WebSocket 在 `start` 时固定模型 ID 和路径，
+但只在每段生成时持有 LoRA 缓存租约；等待文本的空闲连接不会固定显存。
+缓存满且所有 LoRA 都在使用时，新的适配器请求返回 `409`。
 
 例如，取得真实 `voice_id` 后，按顺序发送以下消息：
 
 ```json
-{"type":"start","voice_id":"example_voice","cfg_scale":2,"seed":42}
+{"type":"start","model_id":"voice-a","execution":"serial","voice_id":"example_voice","cfg_scale":2,"seed":42}
 {"type":"instruction","instruction":"Sound delighted and playful."}
 {"type":"flush","text":"(laugh) 你终于来啦，我正想着要不要去找你呢。"}
 {"type":"instruction","instruction":"Soften into a gentle, reassuring tone."}
@@ -89,14 +91,14 @@ WebSocket 的音频生成可以等待 GPU，并发送 `queued`。
 
 收到的音频是 24 kHz、单声道、16 位小端 PCM；保存为 WAV 时需要添加 WAV 文件头。
 `cancel` 会停止当前生成并清空待说文本，已经收到的音频仍然有效。
-Bot 取消后应完成连接清理，再让后续请求切换模型。
+Bot 取消后应完成连接清理，再提交后续段落。
 
 ## HTTP 与网页
 
 网页的声音设计、参考音色克隆和语气控制都调用 `POST /v1/audio/speech`。
-网页音色菜单选择参考音频；活动模型由上述模型接口选择。
+网页音色菜单选择参考音频；未指定模型的请求使用服务默认值。
 原生表单响应是 PCM；OpenAI 风格 JSON 可指定 `response_format="wav"` 等格式。
-OpenAI JSON 的 `model` 字段不会自动调用模型切换接口。
+OpenAI JSON 的标准 `model` 字段会选择本次请求的注册模型；它不会改变服务默认值。
 
 HTTP 的 `split_chars=0` 表示一次生成整段；WebSocket 的 0 使用默认预算 600，仍按句处理。
 `flush` 只会立即提交缓冲文本，超过分段预算时仍可能拆分。

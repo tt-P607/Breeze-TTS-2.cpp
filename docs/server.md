@@ -1,13 +1,14 @@
 # Server API
 
 `breeze-server` is a single binary HTTP server built on cpp-httplib. It loads
-one model, serves it over HTTP, and streams raw PCM as the audio is generated
-rather than waiting for the whole clip.
+one base model and can register LoRA adapters, serves them over HTTP, and streams
+raw PCM as the audio is generated rather than waiting for the whole clip.
 
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Liveness, sample rate, websocket port |
 | `POST /v1/audio/speech` | Generate speech, streamed. Also takes OpenAI style JSON, see [OpenAI compatible requests](#openai-compatible-requests) |
+| `POST /v1/audio/speech/batch` | Generate a JSON batch of audio items, see [Batch requests](#batch-requests) |
 | `POST /v1/audio/convert` | Respeak a recording in another voice, see [voice-conversion.md](voice-conversion.md) |
 | `POST /v1/voices` | Register or save a reference voice, see [voices.md](voices.md) |
 | `GET /v1/voices` | List cached and saved voices |
@@ -25,6 +26,7 @@ breeze-server <model.gguf> [--host H] [--port P] [--webui] [--cpu]
                            [--chunk-first N] [--chunk-max N] [--verbose]
                            [--voices-dir PATH] [--ws-port P] [--split-chars N]
                            [--cors [ORIGINS]] [--no-warmup] [--parallel N]
+                           [--lora-cache-size N] [--lora-idle-seconds N]
 ```
 
 | Flag | Default | Meaning |
@@ -44,7 +46,8 @@ breeze-server <model.gguf> [--host H] [--port P] [--webui] [--cpu]
 | `--parallel` | `1` | Streams generating at once. A stream using guidance counts as two. See [performance.md](performance.md#running-several-streams). |
 | `--model-id` | `default` | ID of the initial full model. |
 | `--switchable-lora ID=PATH` | none | Register a LoRA adapter without loading it. See [lora.md](lora.md). |
-| `--lora-cache-size` | `1` | Maximum number of resident LoRA adapters. The base model is shared. |
+| `--lora-cache-size` | `6` | Maximum number of resident LoRA adapters. The base model is shared. |
+| `--lora-idle-seconds` | `900` | Unload an adapter after this many seconds without a request using it. |
 
 ```
 breeze-server breeze-tts-2-q4_k.gguf --port 8137 --webui
@@ -58,16 +61,23 @@ breeze-server base.gguf --model-id base \
   --switchable-lora voice-b=voice-b.gguf
 ```
 
-Read the active ID and configured choices with `GET /v1/models`. Select a model
-by sending `POST /v1/models/active` with JSON such as
-`{"model_id":"voice-b"}`. Selecting the already active ID is a no-op.
-The server shares the base model and loads adapters only when selected.
-`--lora-cache-size` controls how many adapters remain resident. A switch returns `409` while an
-HTTP generation or a WebSocket session is active; close WebSocket connections
-before switching. Selecting the base ID disables the active adapter.
-The endpoint only accepts localhost requests. A request can register an adapter
-with `{"model_id":"voice-c","lora_path":"/absolute/path/voice-c.gguf"}`.
-See [lora.md](lora.md) for conversion and cache behavior.
+`GET /v1/models` lists registered IDs and their `loaded`, `in_use`, and `idle_seconds`
+state. Its `active_model` value is the default for requests that do not name a model;
+`lora_cache` reports `capacity`, `idle_timeout_seconds`, and the number of loaded adapters.
+Adapters load on demand and idle adapters, including the current default, unload after the
+configured timeout.
+
+Model choice is per request. Native form requests use `model_id` with optional `lora_path`;
+OpenAI JSON uses the standard `model` field with optional `lora_path`; WebSocket `start` uses
+`model_id` and optional `lora_path`. A `lora_path` must be an absolute path on the server and is accepted only from localhost.
+Unknown IDs and failed loads return errors rather than falling back to the default or base model.
+Different LoRAs can generate concurrently when requests explicitly use `execution=parallel` and
+`--parallel` allows it; requests otherwise run serially.
+
+`POST /v1/models/active` only changes the default for later requests without an explicit model.
+It does not affect requests already running or WebSocket sessions that have started. It only
+accepts localhost requests. Supplying `lora_path` with `model_id` registers that ID after the
+adapter loads successfully. See [lora.md](lora.md) for the request fields and cache behavior.
 
 Before it starts listening the server runs a short throwaway generation for every
 mix of streams its `--parallel` setting allows, with and without guidance, and
@@ -279,6 +289,9 @@ Accepts `multipart/form-data` (needed for the reference audio upload) or
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `text` | string | required | Text to speak, UTF-8. |
+| `model_id` | string | current default | Registered model ID for this request. |
+| `lora_path` | string | none | Absolute local adapter path. With `model_id`, registers or updates that ID after a successful load. |
+| `execution` | string | `serial` | `serial` excludes other TTS requests; `parallel` may overlap requests that also explicitly use `parallel`. |
 | `instruction` | string | `Speak clearly and naturally.` | Voice description or delivery direction. |
 | `ref_audio` | file | none | Reference WAV for cloning. Any sample rate or channel count; resampled to mono at the model rate. Identical repeated uploads (same bytes and transcript) reuse the reference encode from the in-memory hash cache instead of re-encoding; see [voices.md](voices.md). |
 | `ref_text` | string | empty | Exact transcript of `ref_audio`. Required whenever `ref_audio` is present. |
@@ -326,15 +339,19 @@ long before generation finishes.
 | Status | Body | Cause |
 | --- | --- | --- |
 | `400` | `{"error":"text is required"}` | `text` missing or empty. |
-| `404` | `{"error":"unknown voice_id"}` | No cached or saved voice by that name. |
-| `409` | `{"error":"busy"}` | Every generation slot is taken. |
+| `403` | `{"error":"lora_path is restricted to localhost requests"}` | A request from another host supplied `lora_path`. |
+| `404` | `{"error":"unknown model_id"}` or `{"error":"unknown voice_id"}` | The model ID or reference voice is not registered. |
+| `409` | `{"error":"busy"}` | The execution mode is occupied, every generation slot is taken, or the LoRA cache is full and all entries are in use. |
+| `422` | `{"error":"failed to load LoRA adapter"}` | The selected adapter could not be loaded. |
 
-The server holds one model and by default serves one request at a time. `--parallel`
-raises that, and a request using guidance takes two slots, see
+The server shares one base model. Requests default to `execution=serial`, which excludes
+other TTS generation requests until the whole HTTP response finishes. Set `execution=parallel`
+to allow overlap with other explicitly parallel requests. `--parallel` sets the GPU slot limit;
+a request using guidance takes two slots, see
 [performance.md](performance.md#running-several-streams). A request that does not
 fit is rejected immediately with `409` rather than queued, so clients should retry
-with backoff. The WebSocket endpoint queues instead of refusing, which is one reason
-to prefer it for anything conversational.
+with backoff. Parallel requests may use different LoRAs in the same scheduling batch. The WebSocket
+endpoint queues generation instead of refusing, which is useful for conversational clients.
 
 Because the response is streamed, a failure that happens **after** the first
 chunk cannot change the status code. The connection is closed early instead, so
@@ -396,14 +413,15 @@ ffmpeg -f s16le -ar 24000 -ac 1 -i speech.pcm speech.wav
 
 `POST /v1/audio/speech` also takes the JSON body of OpenAI's speech API, so
 apps built for it, like SillyTavern or the official OpenAI SDKs, can point at
-the server as they are. The `Content-Type` header decides which one you get:
+the server. Set `model` to a registered ID, or omit it to use the current default.
+The `Content-Type` header decides which request format you get:
 `application/json` gets the behaviour described here, a form post gets the
 native behaviour above.
 
 ```
 curl http://127.0.0.1:8137/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"model":"tts-1","input":"Hello from Breeze.","voice":"narrator","response_format":"mp3"}' \
+  -d '{"model":"base","input":"Hello from Breeze.","voice":"narrator","response_format":"mp3"}' \
   -o speech.mp3
 ```
 
@@ -414,7 +432,7 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8137/v1", api_key="unused")
 with client.audio.speech.with_streaming_response.create(
-    model="tts-1", voice="narrator", input="Streaming from the OpenAI SDK.",
+    model="base", voice="narrator", input="Streaming from the OpenAI SDK.",
 ) as r:
     r.stream_to_file("speech.mp3")
 ```
@@ -428,7 +446,9 @@ with client.audio.speech.with_streaming_response.create(
 | `instructions` | string | `Speak clearly and naturally.` | Voice description when designing, delivery direction when cloning. |
 | `response_format` | string | `mp3` | `mp3`, `wav` or `pcm`. `opus`, `aac` and `flac` are accepted but sent as WAV. |
 | `stream_format` | string | `audio` | `audio` streams the file itself, `sse` wraps it in server sent events. |
-| `model` | string | ignored | Accepted so clients that always send one keep working. |
+| `model` | string | current default | Registered model ID for this request. This is the standard OpenAI field; `model_id` is not accepted as an alias in JSON. |
+| `lora_path` | string | none | Absolute local adapter path. With `model`, registers or updates that ID after a successful load. |
+| `execution` | string | `serial` | `serial` or `parallel`, with the same behavior as the native form field. |
 | `speed` | number | ignored | The model has no speed control. |
 
 The native fields `cfg_scale`, `seed`, `temperature`, `top_k`, `top_p`,
@@ -487,12 +507,36 @@ instead of a bare status code.
 
 | Status | Cause |
 | --- | --- |
-| `400` | The body is not a JSON object, `input` is missing, or a field has the wrong type or an unknown value. |
-| `404` | `voice` is not a saved or cached voice. |
-| `409` | Every generation slot is taken. The OpenAI SDKs retry this on their own. |
+| `400` | The body is not a JSON object, `input` is missing, or a field has the wrong type or an invalid path. |
+| `403` | A request from another host supplied `lora_path`. |
+| `404` | `voice` is not saved or cached, or `model` is not registered. |
+| `409` | The execution mode is occupied, every generation slot is taken, or the LoRA cache is full and all entries are in use. |
+| `422` | The selected LoRA failed to load. |
 
 The `Authorization` header is ignored, so any API key works. That also means
 there is still no authentication, see the warning above.
+
+## Batch requests
+
+`POST /v1/audio/speech/batch` accepts JSON with one `execution` mode and an `items` array.
+Each item uses the OpenAI speech fields such as `input`, `model`, `voice`, `response_format`,
+and `lora_path`; the top-level mode applies to the whole batch, so items do not set `execution`.
+The default is serial. Explicit parallel mode may run items concurrently, subject to the
+server's `--parallel` slot limit and available LoRA cache capacity.
+
+```json
+{
+  "execution": "parallel",
+  "items": [
+    {"id": "a", "model": "voice-a", "input": "First line.", "voice": "narrator", "response_format": "wav"},
+    {"id": "b", "model": "voice-b", "input": "Second line.", "voice": "narrator", "response_format": "wav"}
+  ]
+}
+```
+
+The JSON response contains `results` in input order. Each result reports its `id`, `model`,
+`status`, `format`, `sample_rate`, and `audio_base64`. The batch endpoint does not multiplex
+streaming audio; use the single speech endpoint for streamed playback.
 
 ### SillyTavern
 
@@ -502,7 +546,7 @@ Open the TTS extension, pick **OpenAI Compatible** as the provider and fill in:
 | --- | --- |
 | Provider Endpoint | `http://127.0.0.1:8137/v1/audio/speech` |
 | API Key | Anything, it is ignored. |
-| Model | Anything, it is ignored. |
+| Model | A registered model ID such as `base` or `voice-a`. |
 | Available Voices | The voice ids you want, comma separated, e.g. `narrator,harbour`. The list from `GET /v1/voices` has them all. |
 
 The default voice list is OpenAI's names, which will all come back `404` until

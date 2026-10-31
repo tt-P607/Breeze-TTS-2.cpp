@@ -1,11 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace breeze {
@@ -14,7 +16,8 @@ namespace breeze {
 // the socket after an upgrade, so this listens on its own port
 class WsConn {
 public:
-    explicit WsConn(uint64_t sock) : m_sock(sock) {}
+    explicit WsConn(uint64_t sock, std::string remote_addr = {})
+        : m_sock(sock), m_remote_addr(std::move(remote_addr)) {}
     ~WsConn();
 
     // blocks for one whole message. false when the peer closed or the frame was malformed.
@@ -26,12 +29,14 @@ public:
 
     void close();
     bool alive() const { return !m_closed; }
+    const std::string & remote_addr() const { return m_remote_addr; }
 
 private:
     bool send(int opcode, const void * data, size_t n);
     bool read_n(void * buf, size_t n);
 
     uint64_t m_sock;
+    std::string m_remote_addr;
     std::mutex m_send; // audio goes out from the speaker thread while the reader may send events
     std::atomic<bool> m_closed{false};
 };
@@ -52,6 +57,9 @@ private:
     Handler m_handler;
     std::thread m_thread;
     std::atomic<bool> m_running{false};
+    std::mutex m_connections_mutex;
+    std::condition_variable m_connections_cv;
+    std::vector<uint64_t> m_connections;
 };
 
 } // namespace breeze

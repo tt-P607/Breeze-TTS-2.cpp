@@ -84,15 +84,48 @@ std::string base64(const std::string & in) {
 
 } // namespace
 
+std::string audio_base64(const std::string & bytes) { return base64(bytes); }
+
+std::string json_quote(const std::string & value) { return "\"" + esc(value) + "\""; }
+
 std::string parse_openai_speech(const std::string & body, VoiceStore & store, int split_chars,
                                 OpenAiSpeech & out, int & status) {
     status = 400;
     JVal root;
-    if (!JParser(body).parse(root) || root.kind != JVal::Obj) return "request body must be a json object";
+    if (!JParser(body).parse(root)) return "request body must be a json object";
+    return parse_openai_speech(root, store, split_chars, out, status);
+}
+
+std::string parse_openai_speech(const JVal & root, VoiceStore & store, int split_chars,
+                                OpenAiSpeech & out, int & status) {
+    status = 400;
+    out = OpenAiSpeech{};
+    if (root.kind != JVal::Obj) return "request body must be a json object";
+    if (get(root, "model_id")) return "use the standard model field instead of model_id";
 
     GenRequest & g = out.g;
     if (!str_field(root, "input", g.text)) return "input must be a string";
     if (g.text.empty()) return "input is required";
+
+    const JVal * model = get(root, "model");
+    if (model) {
+        if (model->kind != JVal::Str || model->str.empty()) return "model must be a nonempty string";
+        out.model = model->str;
+        out.has_model = true;
+    }
+    const JVal * lora_path = get(root, "lora_path");
+    if (lora_path) {
+        if (lora_path->kind != JVal::Str || lora_path->str.empty())
+            return "lora_path must be a nonempty absolute path";
+        out.lora_path = lora_path->str;
+        out.has_lora_path = true;
+    }
+    const JVal * execution = get(root, "execution");
+    if (execution) {
+        if (execution->kind != JVal::Str || (execution->str != "serial" && execution->str != "parallel"))
+            return "execution must be serial or parallel";
+        out.parallel = execution->str == "parallel";
+    }
 
     std::string ins;
     if (!str_field(root, "instructions", ins)) return "instructions must be a string";
@@ -126,7 +159,7 @@ std::string parse_openai_speech(const std::string & body, VoiceStore & store, in
     if (stream == "sse") out.sse = true;
     else if (!stream.empty() && stream != "audio") return "stream_format must be audio or sse";
 
-    // the native knobs ride along as extra fields, model and speed are accepted and ignored
+    // the native knobs ride along as extra fields; speed remains accepted and ignored
     double cfg = g.cfg_scale, seed = g.seed, temp = 0, top_k = 0, top_p = 0, rep = 0, max_tok = 0;
     double split = split_chars;
     const std::pair<const char *, double *> nums[] = {
