@@ -12,7 +12,9 @@ PCM WAV samples, result.json, and server.log under --output-dir.
 """
 
 import argparse
+import base64
 import hashlib
+import io
 import json
 import os
 import socket
@@ -229,7 +231,13 @@ def open_speech(url, form, timeout=HTTP_TIMEOUT):
     return client, response
 
 
-def speech_form(model_id=None, lora_path=None, max_new_tokens=8, text=SHORT_TEXT):
+def speech_form(
+    model_id=None,
+    lora_path=None,
+    max_new_tokens=8,
+    text=SHORT_TEXT,
+    execution=None,
+):
     form = {
         "text": text,
         "instruction": SHORT_INSTRUCTION,
@@ -242,6 +250,8 @@ def speech_form(model_id=None, lora_path=None, max_new_tokens=8, text=SHORT_TEXT
         form["model_id"] = model_id
     if lora_path is not None:
         form["lora_path"] = str(lora_path)
+    if execution is not None:
+        form["execution"] = execution
     return form
 
 
@@ -252,11 +262,12 @@ def save_pcm(path, pcm, sample_rate):
 
 
 def synthesize(server, report, report_lock, label, model_id, lora_path=None,
-               max_new_tokens=8, text=SHORT_TEXT, save_audio=True, timeout=HTTP_TIMEOUT):
+               max_new_tokens=8, text=SHORT_TEXT, save_audio=True, timeout=HTTP_TIMEOUT,
+               execution=None):
     started = time.monotonic()
     client, response = open_speech(
         server.url,
-        speech_form(model_id, lora_path, max_new_tokens, text),
+        speech_form(model_id, lora_path, max_new_tokens, text, execution),
         timeout=timeout,
     )
     try:
@@ -292,15 +303,22 @@ def synthesize(server, report, report_lock, label, model_id, lora_path=None,
         client.close()
 
 
-def expect_bad_speech(server, form, label):
+def expect_bad_speech(server, form, label, expected_status=None):
     client, response = open_speech(server.url, form, timeout=30)
     try:
         body = response.text[:1000]
-        require(
-            400 <= response.status_code < 500,
-            f"{label} should return a client error, got HTTP "
-            f"{response.status_code}: {body}",
-        )
+        if expected_status is not None:
+            require(
+                response.status_code == expected_status,
+                f"{label} should return HTTP {expected_status}, got "
+                f"HTTP {response.status_code}: {body}",
+            )
+        else:
+            require(
+                400 <= response.status_code < 500,
+                f"{label} should return a client error, got HTTP "
+                f"{response.status_code}: {body}",
+            )
         return {"label": label, "status": response.status_code, "body": body}
     finally:
         response.close()
@@ -387,6 +405,7 @@ def websocket_sample(server, model_id, text, flush=False):
                     "cfg_scale": 1,
                     "split_chars": 0,
                     "max_new_tokens": 8,
+                    "execution": "serial",
                 }
             )
         )
@@ -456,6 +475,59 @@ def test_serial_and_dynamic_paths(server, report, report_lock, adapter_paths):
     return pcm_a, pcm_b
 
 
+def test_serial_gate(server, report, report_lock):
+    token_count = 32
+    text = "这段短文本用于验证串行请求的执行门控。"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        active = pool.submit(
+            synthesize,
+            server,
+            report,
+            report_lock,
+            "serial-gate-holder",
+            "voice-a",
+            None,
+            token_count,
+            text,
+            False,
+            HTTP_TIMEOUT,
+            "serial",
+        )
+        wait_for_model(
+            server,
+            "voice-a",
+            lambda row: row["loaded"] and row["in_use"],
+            timeout=60,
+            reason="serial holder did not acquire adapter A",
+        )
+        serial_rejected = expect_bad_speech(
+            server,
+            speech_form("voice-b", execution="serial"),
+            "second serial request while serial generation is active",
+            expected_status=409,
+        )
+        parallel_rejected = expect_bad_speech(
+            server,
+            speech_form("voice-b", execution="parallel"),
+            "parallel request while serial generation is active",
+            expected_status=409,
+        )
+        require(
+            server.model_rows()["voice-a"]["in_use"],
+            "serial holder ended before both busy responses were checked",
+        )
+        pcm, _ = active.result(timeout=HTTP_TIMEOUT + 30)
+    require(pcm, "serial holder request returned no audio")
+    append_check(
+        report,
+        "serial requests exclude other serial and parallel single requests",
+        {
+            "second_serial_status": serial_rejected["status"],
+            "parallel_while_serial_status": parallel_rejected["status"],
+        },
+    )
+
+
 def test_parallel_requests(server, report, report_lock, pcm_a, pcm_b):
     barrier = threading.Barrier(5)
     jobs = {
@@ -470,7 +542,12 @@ def test_parallel_requests(server, report, report_lock, pcm_a, pcm_b):
             def work(job_label=label, job_model=model_id):
                 barrier.wait(timeout=15)
                 return synthesize(
-                    server, report, report_lock, "parallel-" + job_label, job_model
+                    server,
+                    report,
+                    report_lock,
+                    "parallel-" + job_label,
+                    job_model,
+                    execution="parallel",
                 )[0]
 
             futures[label] = pool.submit(work)
@@ -513,6 +590,120 @@ def test_parallel_requests(server, report, report_lock, pcm_a, pcm_b):
             "a_batch_hash": hashlib.sha256(outputs["a-1"]).hexdigest(),
             "b_batch_hash": hashlib.sha256(outputs["b-1"]).hexdigest(),
         },
+    )
+
+
+def decode_batch_wav(server, result, label):
+    require(result.get("status") == "ok", f"batch item {label} failed: {result}")
+    require(result.get("format") == "wav", f"batch item {label} is not WAV")
+    encoded = result.get("audio_base64")
+    require(isinstance(encoded, str) and encoded, f"batch item {label} omitted audio_base64")
+    try:
+        wav_bytes = base64.b64decode(encoded, validate=True)
+        with wave.open(io.BytesIO(wav_bytes), "rb") as audio:
+            channels = audio.getnchannels()
+            sample_width = audio.getsampwidth()
+            sample_rate = audio.getframerate()
+            frames = audio.readframes(audio.getnframes())
+            require(audio.getcomptype() == "NONE", f"batch item {label} is compressed")
+    except (ValueError, wave.Error) as error:
+        raise SmokeFailure(f"batch item {label} contains invalid WAV: {error}") from error
+    require(channels == 1, f"batch item {label} should be mono")
+    require(sample_width == 2, f"batch item {label} should be PCM16")
+    require(sample_rate == result.get("sample_rate"), f"batch item {label} sample rate mismatch")
+    require(frames and len(frames) % 2 == 0, f"batch item {label} has empty or invalid PCM")
+    for timing in ("first_audio_ms", "wall_ms"):
+        value = result.get(timing)
+        require(
+            isinstance(value, (int, float)) and value >= 0,
+            f"batch item {label} has invalid {timing}: {value!r}",
+        )
+    filename = f"{label}.wav"
+    (server.output_dir / filename).write_bytes(wav_bytes)
+    return {
+        "label": label,
+        "sha256": hashlib.sha256(wav_bytes).hexdigest(),
+        "sample_rate": sample_rate,
+        "pcm_bytes": len(frames),
+        "first_audio_ms": result["first_audio_ms"],
+        "wall_ms": result["wall_ms"],
+        "wav": filename,
+    }
+
+
+def batch_request(server, execution, items):
+    require(
+        all("execution" not in item for item in items),
+        "execution must be set only at the batch top level",
+    )
+    response = server.session.post(
+        server.url + "/v1/audio/speech/batch",
+        json={"execution": execution, "items": items},
+        timeout=HTTP_TIMEOUT,
+    )
+    require(
+        response.ok,
+        f"batch {execution} request failed: HTTP {response.status_code}: "
+        f"{response.text[:1000]}",
+    )
+    body = response.json()
+    results = body.get("results")
+    require(isinstance(results, list), f"batch {execution} response omitted results")
+    require(len(results) == len(items), f"batch {execution} result count mismatch")
+    return results
+
+
+def test_batch_api(server, report):
+    items = [
+        {
+            "id": "batch-a-1",
+            "input": SHORT_TEXT,
+            "model": "voice-a",
+            "cfg_scale": 1,
+            "max_new_tokens": 8,
+        },
+        {
+            "id": "batch-a-2",
+            "input": SHORT_TEXT,
+            "model": "voice-a",
+            "cfg_scale": 1,
+            "max_new_tokens": 8,
+        },
+        {
+            "id": "batch-b-1",
+            "input": SHORT_TEXT,
+            "model": "voice-b",
+            "cfg_scale": 1,
+            "max_new_tokens": 8,
+        },
+        {
+            "id": "batch-b-2",
+            "input": SHORT_TEXT,
+            "model": "voice-b",
+            "cfg_scale": 1,
+            "max_new_tokens": 8,
+        },
+    ]
+    expected_ids = [item["id"] for item in items]
+    details = {}
+    for execution in ("serial", "parallel"):
+        results = batch_request(server, execution, items)
+        ids = [result.get("id") for result in results]
+        require(ids == expected_ids, f"batch {execution} changed input result order: {ids}")
+        for item, result in zip(items, results):
+            require(
+                result.get("model") == item["model"],
+                f"batch {execution} returned the wrong model for {item['id']}",
+            )
+        details[execution] = [
+            decode_batch_wav(server, result, f"batch-{execution}-{result['id']}")
+            for result in results
+        ]
+    report["batch_audio"] = details
+    append_check(
+        report,
+        "batch serial and parallel modes return ordered, decodable WAV results",
+        {"result_ids": expected_ids, "modes": ["serial", "parallel"]},
     )
 
 
@@ -641,6 +832,7 @@ def test_idle_websocket_reload(server, report, idle_seconds):
                     "cfg_scale": 1,
                     "split_chars": 0,
                     "max_new_tokens": 8,
+                    "execution": "serial",
                 }
             )
         )
@@ -681,7 +873,12 @@ def test_disconnect_isolation(server, report, report_lock, idle_seconds):
     def disconnect_a():
         client, response = open_speech(
             server.url,
-            speech_form("voice-a", max_new_tokens=token_count, text=text),
+            speech_form(
+                "voice-a",
+                max_new_tokens=token_count,
+                text=text,
+                execution="parallel",
+            ),
         )
         with holder_lock:
             holder["client"] = client
@@ -717,6 +914,7 @@ def test_disconnect_isolation(server, report, report_lock, idle_seconds):
             text,
             False,
             HTTP_TIMEOUT,
+            "parallel",
         )
         deadline = time.monotonic() + 90
         overlap = False
@@ -906,7 +1104,9 @@ def run(args):
         pcm_a, pcm_b = test_serial_and_dynamic_paths(
             server, report, report_lock, adapters
         )
+        test_serial_gate(server, report, report_lock)
         test_parallel_requests(server, report, report_lock, pcm_a, pcm_b)
+        test_batch_api(server, report)
         test_failures_and_default(server, report, report_lock, output_dir, pcm_b)
         test_idle_expiry(server, report, report_lock, args.idle_seconds)
         test_active_lease_expiry(server, report, report_lock, args.idle_seconds)
