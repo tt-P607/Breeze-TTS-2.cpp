@@ -264,14 +264,15 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
         }
         parallel_execution = execution->second.str == "parallel";
     }
-    if (has_path && !loopback_peer(conn.remote_addr())) {
+    if ((has_path || msg.obj.count("extra_loras")) && !loopback_peer(conn.remote_addr())) {
         event(conn, "error", "\"message\":\"lora_path is restricted to localhost requests\"");
         return;
     }
     Models::Selection selection;
     int status = 0;
     std::string error;
-    if (!models.select(has_id, model_id, has_path, lora_path, selection, status, error)) {
+    if (!models.select(has_id, model_id, has_path, lora_path, selection, status, error) ||
+        !models.configure(msg, selection, status, error)) {
         event(conn, "error", "\"message\":\"" + esc(error) + "\"");
         return;
     }

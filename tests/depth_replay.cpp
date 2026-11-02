@@ -68,21 +68,29 @@ static void test_lora_projection(BreezeModel & m) {
     auto expected_a = base, expected_b = base;
     expected_a[0] += 3.0f;
     expected_b[0] -= 6.0f;
+    m.add_lora_stack("mixed", {{"voice-a", 0.9f}, {"voice-b", 1.8f}});
+    m.add_lora_stack("zero", {{"voice-a", 0.0f}});
+    auto expected_mixed = base;
+    expected_mixed[0] += 3.0f * 0.9f - 6.0f * 1.8f;
     for (int round = 0; round < 3; round++) {
         close(project("voice-a"), expected_a);
         close(project("voice-b"), expected_b);
         close(project(""), base);
-        require(m.active_lora == nullptr, "LoRA leaked outside its request scope");
+        close(project("mixed"), expected_mixed);
+        close(project("zero"), base);
+        require(m.active_loras.empty(), "LoRA leaked outside its request scope");
     }
     {
         ScopedLora a(m, "voice-a");
         close(project("voice-b"), expected_b);
-        require(m.active_lora == m.loras.at("voice-a").get(), "nested LoRA scope did not restore its caller");
+        require(m.active_loras.size() == 1 && m.active_loras[0].adapter == m.loras.at("voice-a").get(),
+                "nested LoRA scope did not restore its caller");
     }
     GenScheduler scheduler;
     scheduler.start(m, 4);
     require(&scheduler.pool("voice-a") != &scheduler.pool("voice-b"), "adapters share a generation pool");
     require(&scheduler.pool("voice-a") == &scheduler.pool("voice-a"), "adapter pool was not reused");
+    scheduler.exec([&] { scheduler.unload_lora("mixed"); scheduler.unload_lora("zero"); });
     scheduler.exec([&] { scheduler.unload_lora("voice-a"); });
     require(!m.loras.count("voice-a"), "idle adapter was not unloaded");
     close(project("voice-b"), expected_b);

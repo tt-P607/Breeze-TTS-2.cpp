@@ -1,4 +1,5 @@
 #include "models.h"
+#include "json.h"
 
 #include "breeze/model.h"
 #include "breeze/scheduler.h"
@@ -10,14 +11,17 @@
 #include <stdexcept>
 #include <system_error>
 #include <utility>
+#include <cmath>
+#include <cstring>
+#include <set>
 
 namespace breeze {
 
-Models::Lease::Lease(Models & owner, std::string path, std::string slot, bool base)
-    : m_owner(&owner), m_path(std::move(path)), m_slot(std::move(slot)), m_base(base) {}
+Models::Lease::Lease(Models & owner, std::vector<std::string> paths, std::string slot, bool base)
+    : m_owner(&owner), m_paths(std::move(paths)), m_slot(std::move(slot)), m_base(base) {}
 
 Models::Lease::~Lease() {
-    if (m_owner) m_owner->release(m_path, m_base);
+    if (m_owner) m_owner->release(m_paths, m_slot, m_base);
 }
 
 Models::Models(BreezeModel & model, GenScheduler & sched, const std::string & base_id,
@@ -124,6 +128,57 @@ bool Models::select(bool has_id, const std::string & id, bool has_path, const st
     return true;
 }
 
+bool Models::configure(const JVal & body, Selection & selected, int & status, std::string & error) const {
+    status = 400;
+    const auto weight = [&](const JVal & object, const char * key, float & out) {
+        const auto it = object.obj.find(key);
+        if (it == object.obj.end()) return true;
+        if (it->second.kind != JVal::Num || !std::isfinite(it->second.num) ||
+            it->second.num < 0 || !std::isfinite((float) it->second.num)) {
+            error = std::string(key) + " must be a finite nonnegative number";
+            return false;
+        }
+        out = (float) it->second.num;
+        return true;
+    };
+    selected.weight = 1.0f;
+    selected.extra_loras.clear();
+    if (!weight(body, "lora_weight", selected.weight)) return false;
+    std::set<std::string> paths;
+    if (!selected.path.empty()) paths.insert(selected.path);
+    const auto extras = body.obj.find("extra_loras");
+    if (extras != body.obj.end()) {
+        if (extras->second.kind != JVal::Arr) {
+            error = "extra_loras must be an array";
+            return false;
+        }
+        for (const auto & item : extras->second.arr) {
+            const auto path = item.obj.find("lora_path");
+            Adapter adapter;
+            if (item.kind != JVal::Obj || path == item.obj.end() || path->second.kind != JVal::Str ||
+                !normalize_path(path->second.str, true, adapter.path)) {
+                error = "each extra_loras item needs an absolute lora_path";
+                return false;
+            }
+            if (!weight(item, "weight", adapter.weight)) return false;
+            if (!paths.insert(adapter.path).second) {
+                error = "a LoRA path may occur only once per request";
+                return false;
+            }
+            selected.extra_loras.push_back(std::move(adapter));
+        }
+    }
+    std::size_t count = !selected.path.empty() && selected.weight != 0 ? 1 : 0;
+    for (const auto & adapter : selected.extra_loras) if (adapter.weight != 0) ++count;
+    if (count > (std::size_t) m_capacity) {
+        error = "request uses more LoRAs than --lora-cache-size allows";
+        return false;
+    }
+    status = 200;
+    error.clear();
+    return true;
+}
+
 std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int & status, std::string & error,
                                              const std::function<bool()> & cancelled) {
     status = 200;
@@ -138,46 +193,87 @@ std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int &
     };
     if (aborted()) return {};
 
-    if (selected.path.empty()) {
-        if (selected.id != m_base_id) {
-            status = 404;
-            error = "unknown model_id";
-            return {};
-        }
-        ++m_base_users;
-        return std::shared_ptr<Lease>(new Lease(*this, "", "", true));
+    std::map<std::string, float> requested;
+    if (!selected.path.empty() && selected.weight != 0) requested.emplace(selected.path, selected.weight);
+    for (const auto & adapter : selected.extra_loras)
+        if (adapter.weight != 0) requested.emplace(adapter.path, adapter.weight);
+    if (requested.size() > (std::size_t) m_capacity) {
+        status = 400;
+        error = "request uses more LoRAs than --lora-cache-size allows";
+        return {};
     }
-
-    auto found = m_cache.find(selected.path);
-    while (found == m_cache.end() && m_cache.size() >= (std::size_t) m_capacity &&
-           std::none_of(m_cache.begin(), m_cache.end(), [](const auto & entry) { return entry.second.users == 0; })) {
+    if (requested.empty()) {
+        ++m_base_users;
+        return std::shared_ptr<Lease>(new Lease(*this, {}, "", true));
+    }
+    // Reserve the whole set together: two queued stacks must never each hold half their adapters.
+    const auto fits = [&] {
+        std::size_t busy_outside = 0;
+        for (const auto & item : m_cache)
+            if (item.second.users != 0 && !requested.count(item.first)) ++busy_outside;
+        return busy_outside + requested.size() <= (std::size_t) m_capacity;
+    };
+    while (!fits()) {
         m_available.wait_for(lock, std::chrono::milliseconds(100));
         if (aborted()) return {};
-        found = m_cache.find(selected.path);
     }
-    if (found == m_cache.end()) {
-
-        const std::string slot = "__breeze_lora_" + std::to_string(m_next_slot++);
-        bool loaded = false;
-        m_sched.exec([&] { loaded = m_model.load_lora(slot, selected.path); });
-        if (!loaded) {
-            status = 422;
-            error = "failed to load LoRA adapter";
-            return {};
+    std::size_t missing = 0;
+    for (const auto & item : requested) if (!m_cache.count(item.first)) ++missing;
+    while (m_cache.size() + missing > (std::size_t) m_capacity) {
+        auto victim = m_cache.end();
+        for (auto it = m_cache.begin(); it != m_cache.end(); ++it) {
+            if (it->second.users || requested.count(it->first)) continue;
+            if (victim == m_cache.end() || it->second.last_used < victim->second.last_used) victim = it;
         }
-        const auto now = std::chrono::steady_clock::now();
-        found = m_cache.emplace(selected.path, Entry{slot, 1, now}).first;
-        m_last_used[selected.path] = now;
-        if (selected.register_id && !selected.id.empty()) m_registered[selected.id] = selected.path;
-        evict_to_capacity_locked();
-        printf("LoRA cache loaded: %s\n", selected.path.c_str());
-        fflush(stdout);
-    } else {
-        ++found->second.users;
-        if (selected.register_id && !selected.id.empty()) m_registered[selected.id] = selected.path;
+        unload_locked(victim->first, victim->second);
+        m_cache.erase(victim);
     }
-
-    return std::shared_ptr<Lease>(new Lease(*this, selected.path, found->second.slot, false));
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::string> paths;
+    std::vector<LoraWeight> weights;
+    std::string key;
+    for (const auto & item : requested) {
+        auto found = m_cache.find(item.first);
+        if (found == m_cache.end()) {
+            const std::string slot = "__breeze_lora_" + std::to_string(m_next_slot++);
+            bool loaded = false;
+            m_sched.exec([&] { loaded = m_model.load_lora(slot, item.first); });
+            if (!loaded) {
+                status = 422;
+                error = "failed to load LoRA adapter";
+                return {};
+            }
+            found = m_cache.emplace(item.first, Entry{slot, 0, now}).first;
+            m_last_used[item.first] = now;
+            printf("LoRA cache loaded: %s\n", item.first.c_str());
+            fflush(stdout);
+        }
+        paths.push_back(item.first);
+        weights.push_back({found->second.slot, item.second});
+        uint32_t bits;
+        std::memcpy(&bits, &item.second, sizeof bits);
+        key += found->second.slot + ":" + std::to_string(bits) + ";";
+    }
+    std::string slot = weights.front().id;
+    if (weights.size() != 1 || weights.front().weight != 1.0f) {
+        auto stack = m_stacks.find(key);
+        if (stack == m_stacks.end()) {
+            slot = "__breeze_stack_" + std::to_string(m_next_slot++);
+            m_sched.exec([&] { m_model.add_lora_stack(slot, weights); });
+            stack = m_stacks.emplace(key, Stack{Entry{slot, 0, now}, paths}).first;
+            printf("LoRA stack %s:", slot.c_str());
+            for (const auto & item : weights) printf(" %s@%.6g", item.id.c_str(), item.weight);
+            printf("\n");
+            fflush(stdout);
+        }
+        slot = stack->second.cache.slot;
+        ++stack->second.cache.users;
+    }
+    for (const auto & path : paths) ++m_cache.at(path).users;
+    if (selected.register_id && !selected.id.empty() && m_cache.count(selected.path))
+        m_registered[selected.id] = selected.path;
+    trim_stacks_locked();
+    return std::shared_ptr<Lease>(new Lease(*this, std::move(paths), slot, false));
 }
 
 bool Models::set_default(const std::string & id, int & status, std::string & error) {
@@ -204,7 +300,8 @@ std::string Models::json() const {
     std::string out = "{\"object\":\"list\",\"active_model\":\"" + escape_json(m_default_id) +
                       "\",\"lora_cache\":{\"capacity\":" + std::to_string(m_capacity) +
                       ",\"idle_timeout_seconds\":" + std::to_string(m_idle_timeout_seconds) +
-                      ",\"loaded\":" + std::to_string(m_cache.size()) + "},\"data\":[";
+                      ",\"loaded\":" + std::to_string(m_cache.size()) +
+                      ",\"weighted_compositions\":" + std::to_string(m_stacks.size()) + "},\"data\":[";
     bool first = true;
     for (const auto & item : m_registered) {
         if (!first) out += ",";
@@ -225,7 +322,7 @@ std::string Models::json() const {
     return out + "]}";
 }
 
-void Models::release(const std::string & path, bool base) {
+void Models::release(const std::vector<std::string> & paths, const std::string & slot, bool base) {
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto now = std::chrono::steady_clock::now();
     if (base) {
@@ -233,31 +330,43 @@ void Models::release(const std::string & path, bool base) {
         m_last_used[""] = now;
         return;
     }
-    auto it = m_cache.find(path);
-    if (it == m_cache.end()) return;
-    if (it->second.users > 0) --it->second.users;
-    it->second.last_used = now;
-    m_last_used[path] = now;
+    for (const auto & path : paths) {
+        auto & entry = m_cache.at(path);
+        --entry.users;
+        entry.last_used = now;
+        m_last_used[path] = now;
+    }
+    for (auto & item : m_stacks) if (item.second.cache.slot == slot) {
+        --item.second.cache.users;
+        item.second.cache.last_used = now;
+        break;
+    }
+    trim_stacks_locked();
     m_available.notify_all();
 }
 
 void Models::unload_locked(const std::string & path, const Entry & entry) {
+    for (auto it = m_stacks.begin(); it != m_stacks.end();) {
+        if (std::find(it->second.paths.begin(), it->second.paths.end(), path) != it->second.paths.end()) {
+            m_sched.exec([&] { m_sched.unload_lora(it->second.cache.slot); });
+            it = m_stacks.erase(it);
+        } else ++it;
+    }
     m_sched.exec([&] { m_sched.unload_lora(entry.slot); });
     printf("LoRA cache unloaded: %s\n", path.c_str());
     fflush(stdout);
 }
 
-void Models::evict_to_capacity_locked() {
-    while (m_cache.size() > (std::size_t) m_capacity) {
-        auto victim = m_cache.end();
-        for (auto it = m_cache.begin(); it != m_cache.end(); ++it) {
-            if (it->second.users != 0) continue;
-            if (victim == m_cache.end() || it->second.last_used < victim->second.last_used) victim = it;
+void Models::trim_stacks_locked() {
+    while (m_stacks.size() > (std::size_t) m_capacity) {
+        auto victim = m_stacks.end();
+        for (auto it = m_stacks.begin(); it != m_stacks.end(); ++it) {
+            if (it->second.cache.users != 0) continue;
+            if (victim == m_stacks.end() || it->second.cache.last_used < victim->second.cache.last_used) victim = it;
         }
-        if (victim == m_cache.end()) return;
-        const std::string path = victim->first;
-        unload_locked(path, victim->second);
-        m_cache.erase(victim);
+        if (victim == m_stacks.end()) return;
+        m_sched.exec([&] { m_sched.unload_lora(victim->second.cache.slot); });
+        m_stacks.erase(victim);
     }
 }
 
@@ -265,6 +374,12 @@ void Models::reap_idle() {
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto now = std::chrono::steady_clock::now();
     const auto timeout = std::chrono::seconds(m_idle_timeout_seconds);
+    for (auto it = m_stacks.begin(); it != m_stacks.end();) {
+        if (it->second.cache.users == 0 && now - it->second.cache.last_used >= timeout) {
+            m_sched.exec([&] { m_sched.unload_lora(it->second.cache.slot); });
+            it = m_stacks.erase(it);
+        } else ++it;
+    }
     for (auto it = m_cache.begin(); it != m_cache.end();) {
         if (it->second.users == 0 && now - it->second.last_used >= timeout) {
             const std::string path = it->first;

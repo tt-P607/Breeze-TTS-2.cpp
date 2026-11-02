@@ -226,13 +226,26 @@ int run_server(const ServerOptions & opts) {
                                        int & status, std::string & error) {
         const bool has_id = req.has_file("model_id") || req.has_param("model_id");
         const bool has_path = req.has_file("lora_path") || req.has_param("lora_path");
-        if (has_path && !loopback_peer(req.remote_addr)) {
+        const bool has_extras = req.has_file("extra_loras") || req.has_param("extra_loras");
+        if ((has_path || has_extras) && !loopback_peer(req.remote_addr)) {
             status = 403;
             error = "lora_path is restricted to localhost requests";
             return false;
         }
-        return models.select(has_id, field(req, "model_id", ""), has_path,
-                             field(req, "lora_path", ""), selection, status, error);
+        if (!models.select(has_id, field(req, "model_id", ""), has_path,
+                           field(req, "lora_path", ""), selection, status, error)) return false;
+        JVal options;
+        for (const char * key : {"lora_weight", "extra_loras"}) {
+            if (!req.has_file(key) && !req.has_param(key)) continue;
+            JVal value;
+            if (!JParser(field(req, key, "")).parse(value)) {
+                status = 400;
+                error = std::string(key) + " must contain valid JSON";
+                return false;
+            }
+            options.obj[key] = std::move(value);
+        }
+        return models.configure(options, selection, status, error);
     };
 
     // OpenAI JSON uses its standard `model` field; native form requests use `model_id`.
@@ -247,13 +260,13 @@ int run_server(const ServerOptions & opts) {
         }
         Models::Selection selection;
         std::string error;
-        if (o.has_lora_path && !loopback_peer(req.remote_addr)) {
+        if ((o.has_lora_path || o.lora_options.obj.count("extra_loras")) && !loopback_peer(req.remote_addr)) {
             res.status = 403;
             res.set_content(openai_error("lora_path is restricted to localhost requests"), "application/json");
             return;
         }
         if (!models.select(o.has_model, o.model, o.has_lora_path, o.lora_path,
-                           selection, status, error)) {
+                           selection, status, error) || !models.configure(o.lora_options, selection, status, error)) {
             res.status = status;
             res.set_content(openai_error(error, status == 409 || status == 422 ? "server_error" : "invalid_request_error"),
                             "application/json");

@@ -10,18 +10,26 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace breeze {
 
 class BreezeModel;
 class GenScheduler;
+struct JVal;
 
 class Models {
 public:
+    struct Adapter {
+        std::string path;
+        float weight = 1.0f;
+    };
     struct Selection {
         std::string id;
         std::string path;
         bool register_id = false;
+        float weight = 1.0f;
+        std::vector<Adapter> extra_loras;
     };
 
     class Lease {
@@ -34,10 +42,10 @@ public:
 
     private:
         friend class Models;
-        Lease(Models & owner, std::string path, std::string slot, bool base);
+        Lease(Models & owner, std::vector<std::string> paths, std::string slot, bool base);
 
         Models * m_owner;
-        std::string m_path;
+        std::vector<std::string> m_paths;
         std::string m_slot;
         bool m_base;
     };
@@ -50,6 +58,8 @@ public:
     // after acquire() has loaded the path successfully.
     bool select(bool has_id, const std::string & id, bool has_path, const std::string & path,
                 Selection & out, int & status, std::string & error) const;
+    // Read optional per-request weights after resolving the role's model ID/path.
+    bool configure(const JVal & body, Selection & selected, int & status, std::string & error) const;
     std::shared_ptr<Lease> acquire(const Selection & selected, int & status, std::string & error,
                                    const std::function<bool()> & cancelled = {});
 
@@ -66,13 +76,17 @@ private:
         std::size_t users = 0;
         std::chrono::steady_clock::time_point last_used;
     };
+    struct Stack {
+        Entry cache;
+        std::vector<std::string> paths;
+    };
 
     static bool valid_id(const std::string & id);
     static bool normalize_path(const std::string & path, bool require_absolute, std::string & out);
     static std::string escape_json(const std::string & value);
 
-    void release(const std::string & path, bool base);
-    void evict_to_capacity_locked();
+    void release(const std::vector<std::string> & paths, const std::string & slot, bool base);
+    void trim_stacks_locked();
     void unload_locked(const std::string & path, const Entry & entry);
     void reaper_loop();
 
@@ -85,6 +99,7 @@ private:
     std::condition_variable m_available;
     std::map<std::string, std::string> m_registered; // model ID -> normalized path; base ID has an empty path
     std::map<std::string, Entry> m_cache;             // normalized path -> resident adapter
+    std::map<std::string, Stack> m_stacks;             // weighted composition -> bounded graph cache
     std::map<std::string, std::chrono::steady_clock::time_point> m_last_used;
     std::string m_base_id;
     std::string m_default_id;

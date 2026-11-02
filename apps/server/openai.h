@@ -15,6 +15,7 @@ struct OpenAiSpeech {
     std::string lora_path;
     bool has_model = false;
     bool has_lora_path = false;
+    JVal lora_options;
     bool parallel = false;
     std::string voice; // empty means voice design
     std::string format = "mp3";

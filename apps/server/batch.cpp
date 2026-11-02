@@ -106,10 +106,11 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
                 item.speech.has_model = true;
                 item.speech.model = default_id;
             }
-            if (item.speech.has_lora_path && !loopback(request.remote_addr))
+            if ((item.speech.has_lora_path || item.speech.lora_options.obj.count("extra_loras")) && !loopback(request.remote_addr))
                 return fail(403, "lora_path is restricted to localhost");
-            models.select(item.speech.has_model, item.speech.model, item.speech.has_lora_path,
-                          item.speech.lora_path, item.selection, item.status, item.error);
+            if (models.select(item.speech.has_model, item.speech.model, item.speech.has_lora_path,
+                              item.speech.lora_path, item.selection, item.status, item.error))
+                models.configure(item.speech.lora_options, item.selection, item.status, item.error);
             items.push_back(std::move(item));
         }
 

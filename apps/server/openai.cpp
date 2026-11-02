@@ -121,6 +121,8 @@ std::string parse_openai_speech(const JVal & root, VoiceStore & store, int split
         out.has_lora_path = true;
     }
     const JVal * execution = get(root, "execution");
+    for (const char * key : {"lora_weight", "extra_loras"})
+        if (const JVal * option = get(root, key)) out.lora_options.obj[key] = *option;
     if (execution) {
         if (execution->kind != JVal::Str || (execution->str != "serial" && execution->str != "parallel"))
             return "execution must be serial or parallel";

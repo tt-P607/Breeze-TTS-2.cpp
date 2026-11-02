@@ -5,6 +5,7 @@
 #include <string>
 #include <stdexcept>
 #include <utility>
+#include <algorithm>
 
 namespace breeze {
 
@@ -79,48 +80,69 @@ bool BreezeModel::load_lora(const std::string & id, const std::string & path) {
 }
 
 bool BreezeModel::set_lora(const std::string & id) {
+    const auto stack = lora_stacks.find(id);
+    if (stack != lora_stacks.end()) {
+        std::vector<ActiveLora> selected;
+        for (const auto & item : stack->second)
+            selected.push_back({loras.at(item.id).get(), item.weight});
+        active_loras = std::move(selected);
+        return true;
+    }
     const auto it = loras.find(id);
     if (it == loras.end()) return false;
-    active_lora = it->second.get();
+    active_loras = {{it->second.get(), 1.0f}};
     return true;
 }
 
+void BreezeModel::add_lora_stack(const std::string & id, const std::vector<LoraWeight> & weights) {
+    for (const auto & item : weights) {
+        if (!loras.count(item.id) || !std::isfinite(item.weight) || item.weight < 0)
+            throw std::runtime_error("invalid LoRA stack member: " + item.id);
+    }
+    lora_stacks.emplace(id, weights);
+}
+
 ScopedLora::ScopedLora(BreezeModel & model, const std::string & id)
-    : model(model), previous(model.active_lora) {
+    : model(model), previous(model.active_loras) {
     if (id.empty()) model.clear_lora();
     else if (!model.set_lora(id)) throw std::runtime_error("unknown LoRA slot: " + id);
 }
 
 ScopedLora::~ScopedLora() {
-    model.active_lora = previous;
+    model.active_loras = std::move(previous);
 }
 
 void BreezeModel::unload_lora(const std::string & id) {
+    lora_stacks.erase(id);
     const auto it = loras.find(id);
     if (it == loras.end()) return;
-    if (active_lora == it->second.get()) active_lora = nullptr;
+    active_loras.erase(std::remove_if(active_loras.begin(), active_loras.end(), [&](const ActiveLora & active) {
+        return active.adapter == it->second.get();
+    }), active_loras.end());
     loras.erase(it);
 }
 
 void BreezeModel::clear_lora() {
-    active_lora = nullptr;
+    active_loras.clear();
 }
 
 ggml_tensor * BreezeModel::project(ggml_context * ctx, const std::string & weight_name, ggml_tensor * x) const {
     ggml_tensor * out = ggml_mul_mat(ctx, gg.get(weight_name), x);
-    if (!active_lora) return out;
-
-    ggml_tensor * a = active_lora->gg.find(weight_name + ".lora_a");
-    if (!a) return out;
-    ggml_tensor * b = active_lora->gg.get(weight_name + ".lora_b");
-
-    ggml_tensor * low_rank = ggml_mul_mat(ctx, a, x);
-    ggml_tensor * delta = ggml_mul_mat(ctx, b, low_rank);
-    return ggml_add(ctx, out, ggml_scale(ctx, delta, active_lora->scale));
+    for (const auto & active : active_loras) {
+        if (active.weight == 0) continue;
+        ggml_tensor * a = active.adapter->gg.find(weight_name + ".lora_a");
+        if (!a) continue;
+        ggml_tensor * b = active.adapter->gg.get(weight_name + ".lora_b");
+        ggml_tensor * low_rank = ggml_mul_mat(ctx, a, x);
+        ggml_tensor * delta = ggml_mul_mat(ctx, b, low_rank);
+        out = ggml_add(ctx, out, ggml_scale(ctx, delta, active.adapter->scale * active.weight));
+    }
+    return out;
 }
 
 void BreezeModel::free() {
     clear_lora();
+    lora_stacks.clear();
     loras.clear();
     gg.free();
     backend.free();
