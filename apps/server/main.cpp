@@ -30,7 +30,7 @@ int main(int argc, char ** argv) {
         printf("  --voices-dir   folder of saved .breeze voices to load at startup (default voices)\n");
         printf("  --model-id     ID of the initially loaded model (default default)\n");
         printf("  --switchable-lora ID=PATH   register a LoRA adapter loaded on request; repeatable\n");
-        printf("  --lora-cache-size N          maximum resident LoRA adapters (default 6)\n");
+        printf("  --lora-cache-size N          adapters retained between requests (default 3); busy overflow is temporary\n");
         printf("  --lora-idle-seconds N        unload adapters after this many idle seconds (default 900)\n");
         printf("  --ws-port      websocket port for streaming sessions, default is the http port + 1,\n");
         printf("                 -1 turns it off\n");

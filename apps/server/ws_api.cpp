@@ -1,15 +1,18 @@
 #include "ws_api.h"
 #include "json.h"
+#include "request_log.h"
 
 #include "breeze/audio.h"
 #include "breeze/generation.h"
 #include "breeze/scheduler.h"
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <thread>
 
 namespace breeze {
@@ -33,6 +36,20 @@ static std::string esc(const std::string & s) {
         else o += c;
     }
     return o;
+}
+
+// Checkpoints must round-trip reference text, including tabs and carriage returns.
+static std::string checkpoint_esc(const std::string & s) {
+    std::string out;
+    for (unsigned char c : s) {
+        if (c == '"' || c == '\\') { out += '\\'; out += (char) c; }
+        else if (c < 0x20) {
+            char buf[7];
+            snprintf(buf, sizeof buf, "\\u%04x", (unsigned) c);
+            out += buf;
+        } else out += (char) c;
+    }
+    return out;
 }
 
 static bool loopback_peer(const std::string & address) {
@@ -99,6 +116,8 @@ struct Session {
     int cost = 1;
     bool parallel_execution = false;
     Models::Selection selection;
+    GenRequest log_parameters;
+    std::string voice_id;
     bool selection_registration_pending = false;
     bool started = false;
     bool ending = false;
@@ -115,12 +134,14 @@ static void event(WsConn & c, const std::string & type, const std::string & extr
 
 // drains the queue one piece at a time, taking a slot for each so other connections interleave
 static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & models,
-                    RequestQueue & execution_queue) {
+                    RequestQueue & execution_queue, const std::string & base_model) {
     for (;;) {
         Piece piece;
         Models::Selection selected;
         bool register_id = false;
         bool parallel_execution = false;
+        GenRequest log_parameters;
+        std::string voice_id;
         {
             std::unique_lock<std::mutex> lock(s.mu);
             s.speaking = false;
@@ -139,8 +160,15 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
             selected = s.selection;
             register_id = s.selection_registration_pending;
             parallel_execution = s.parallel_execution;
+            log_parameters = s.log_parameters;
+            voice_id = s.voice_id;
         }
+        log_parameters.text = piece.text;
+        log_parameters.instruction = piece.instruction;
+        const auto request_log = log_speech_request("WebSocket", base_model, selected, voice_id,
+                                                   log_parameters, parallel_execution);
         if (s.cancel) {
+            log_speech_event(request_log, "已取消");
             s.cancel = false;
             event(conn, "cancelled");
             continue;
@@ -148,26 +176,35 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
 
         const auto cancelled = [&] { return s.cancel || !conn.alive(); };
         RequestExecution permit(execution_queue, parallel_execution, s.cost, cancelled,
-                                [&] { event(conn, "queued"); });
-        if (s.cancel) {
+                                [&] { log_speech_event(request_log, "排队等待"); event(conn, "queued"); });
+        if (!permit.acquired()) {
+            log_speech_event(request_log, "已取消");
+            if (!conn.alive()) return;
             s.cancel = false;
             event(conn, "cancelled");
             continue;
         }
-        if (!conn.alive()) return;
+        if (s.cancel) {
+            log_speech_event(request_log, "已取消");
+            s.cancel = false;
+            event(conn, "cancelled");
+            continue;
+        }
+        if (!conn.alive()) { log_speech_event(request_log, "连接断开"); return; }
 
         selected.register_id = register_id;
         int status = 0;
         std::string error;
         std::shared_ptr<Models::Lease> lease;
         try {
-            lease = models.acquire(selected, status, error, cancelled);
+            lease = models.acquire(selected, status, error, permit.cancellation());
         } catch (const std::exception & e) {
             error = e.what();
         } catch (...) {
             error = "failed to acquire LoRA adapter";
         }
         if (!lease) {
+            log_speech_event(request_log, "加载失败或已取消：" + error);
             if (!conn.alive()) return;
             if (s.cancel) {
                 s.cancel = false;
@@ -179,12 +216,14 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
             continue;
         }
         if (s.cancel) {
+            log_speech_event(request_log, "已取消");
             lease.reset();
             event(conn, "cancelled");
             s.cancel = false;
             continue;
         }
         if (!conn.alive()) {
+            log_speech_event(request_log, "连接断开");
             lease.reset();
             return;
         }
@@ -197,8 +236,10 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
             std::lock_guard<std::mutex> lock(s.mu);
             s.gen.set_instruction(piece.instruction);
             s.gen.set_lora(lease->slot());
+            s.gen.set_cancelled(permit.cancellation());
         }
         event(conn, "speaking", "\"text\":\"" + esc(piece.text) + "\"");
+        log_speech_event(request_log, "开始推理");
 
         bool ok = false;
         try {
@@ -208,11 +249,13 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
                 return conn.send_binary(pcm.data(), pcm.size());
             });
         } catch (const std::exception & e) {
+            log_speech_event(request_log, std::string("生成失败：") + e.what());
             fprintf(stderr, "websocket generation error: %s\n", e.what());
             event(conn, "error", "\"message\":\"generation failed\"");
             lease.reset();
             continue;
         } catch (...) {
+            log_speech_event(request_log, "生成失败：未知错误");
             fprintf(stderr, "websocket generation error: unknown exception\n");
             event(conn, "error", "\"message\":\"generation failed\"");
             lease.reset();
@@ -220,6 +263,8 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
         }
         lease.reset();
         permit.release();
+        log_speech_event(request_log, s.cancel || !conn.alive() ? "已取消或连接断开" :
+                         (ok ? "本段完成" : "本段提前结束"));
 
         if (s.cancel) { event(conn, "cancelled"); s.cancel = false; continue; }
         if (!ok && !conn.alive()) return;
@@ -227,6 +272,7 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
         std::lock_guard<std::mutex> lock(s.mu);
         if (s.queue.empty() && s.ending) {
             s.ending = false;
+            s.speaking = false;
             event(conn, "done");
         }
     }
@@ -300,6 +346,9 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
     s.cost = sched.cost(g.cfg_scale);
     s.parallel_execution = parallel_execution;
     s.selection = std::move(selection);
+    s.log_parameters.cfg_scale = g.cfg_scale;
+    s.log_parameters.seed = g.seed;
+    s.voice_id = vid;
     s.selection_registration_pending = s.selection.register_id;
     s.budget = (int) json_num(msg, "split_chars", split_chars);
     // streaming drains sentence by sentence, so it always needs a real budget to aim at
@@ -315,9 +364,9 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
                    GenScheduler & sched, Models & models,
                    RequestQueue & execution_queue,
-                   int chunk_first, int chunk_max, int split_chars) {
+                   int chunk_first, int chunk_max, int split_chars, const std::string & base_model) {
     Session s;
-    std::thread worker([&] { speaker(conn, s, sched, models, execution_queue); });
+    std::thread worker([&] { speaker(conn, s, sched, models, execution_queue, base_model); });
     event(conn, "ready", "\"sample_rate\":24000,\"format\":\"s16le\"");
 
     std::string raw;
@@ -340,7 +389,68 @@ void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceS
             event(conn, "error", "\"message\":\"send start first\"");
             continue;
         }
-        if (type == "instruction") {
+        if (type == "__gpu_audio_checkpoint") {
+            if (!loopback_peer(conn.remote_addr())) {
+                event(conn, "__gpu_audio_error", "\"message\":\"localhost only\"");
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(s.mu);
+            if (s.speaking || s.ending || !s.queue.empty() || !s.buffer.empty()) {
+                event(conn, "__gpu_audio_error", "\"message\":\"session is not idle\"");
+                continue;
+            }
+            const auto state = s.gen.checkpoint();
+            std::string fields = "\"state\":{\"frames\":" + std::to_string(state.frames) +
+                ",\"piece\":" + std::to_string(state.piece) + ",\"text\":\"" + checkpoint_esc(state.text) + "\",\"codes\":[";
+            for (size_t i = 0; i < state.codes.size(); ++i) {
+                if (i) fields += ",";
+                fields += std::to_string(state.codes[i]);
+            }
+            fields += "]}";
+            event(conn, "__gpu_audio_checkpoint", fields);
+        } else if (type == "__gpu_audio_restore") {
+            if (!loopback_peer(conn.remote_addr())) {
+                event(conn, "__gpu_audio_error", "\"message\":\"localhost only\"");
+                continue;
+            }
+            const auto it = msg.obj.find("state");
+            if (it == msg.obj.end() || it->second.kind != JVal::Obj) {
+                event(conn, "__gpu_audio_error", "\"message\":\"invalid checkpoint\"");
+                continue;
+            }
+            const auto & obj = it->second.obj;
+            const auto frames = obj.find("frames"), piece = obj.find("piece");
+            const auto text = obj.find("text"), codes = obj.find("codes");
+            const auto valid_uint = [](const JVal & v, double limit) {
+                return v.kind == JVal::Num && std::isfinite(v.num) && v.num >= 0 &&
+                    v.num <= limit && std::floor(v.num) == v.num;
+            };
+            if (frames == obj.end() || piece == obj.end() || text == obj.end() || codes == obj.end() ||
+                !valid_uint(frames->second, std::numeric_limits<int>::max()) ||
+                !valid_uint(piece->second, std::numeric_limits<uint32_t>::max()) ||
+                text->second.kind != JVal::Str || codes->second.kind != JVal::Arr ||
+                codes->second.arr.size() > 2000000 ||
+                codes->second.arr.size() != (size_t) frames->second.num * (size_t) model.cfg.num_codebooks) {
+                event(conn, "__gpu_audio_error", "\"message\":\"invalid checkpoint\"");
+                continue;
+            }
+            GenSessionCheckpoint state;
+            state.frames = (int) frames->second.num;
+            state.piece = (uint32_t) piece->second.num;
+            state.text = text->second.str;
+            bool valid = true;
+            for (const auto & code : codes->second.arr) {
+                if (!valid_uint(code, std::numeric_limits<int>::max())) { valid = false; break; }
+                state.codes.push_back((int) code.num);
+            }
+            std::lock_guard<std::mutex> lock(s.mu);
+            if (!valid || s.speaking || s.ending || !s.queue.empty() || !s.buffer.empty()) {
+                event(conn, "__gpu_audio_error", "\"message\":\"invalid or busy session\"");
+                continue;
+            }
+            s.gen.restore_checkpoint(state);
+            event(conn, "__gpu_audio_restored");
+        } else if (type == "instruction") {
             std::lock_guard<std::mutex> lock(s.mu);
             // applies to everything queued from here on, pieces already waiting keep theirs
             s.instruction = json_str(msg, "instruction");

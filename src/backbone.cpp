@@ -95,7 +95,7 @@ static ggml_tensor * bb_layer(ggml_context * ctx, BreezeModel & m, Graph & g, co
 StepOut backbone_run(BreezeModel & m, BackboneState & st, const std::vector<float> & embeds, int n) {
     const BackboneConfig & c = m.cfg.bb;
     const int total = st.pos + n;
-    Graph g(8192);
+    Graph g(8192 + 4 * m.active_loras.size() * (7 * (size_t) c.n_layer + 1));
 
     ggml_tensor * x = g.input_f32(embeds, c.hidden, n);
     std::vector<int32_t> pos_i(n);
@@ -128,7 +128,7 @@ std::vector<StepOut> backbone_run_batch(BreezeModel & m, const std::vector<Backb
                                         const std::vector<float> & embeds) {
     const auto & c = m.cfg.bb;
     const int rows = (int) states.size();
-    Graph g(8192 + 2048 * (size_t) rows);
+    Graph g(8192 + 2048 * (size_t) rows + 4 * m.active_loras.size() * (7 * (size_t) c.n_layer + 1));
     auto * x = g.input_f32(embeds, c.hidden, rows);
     std::vector<int32_t> pos_i(rows);
     std::vector<ggml_tensor *> masks(rows);

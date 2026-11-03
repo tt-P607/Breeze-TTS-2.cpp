@@ -3,6 +3,7 @@
 #include "execution.h"
 #include "models.h"
 #include "openai.h"
+#include "request_log.h"
 #include "server.h"
 
 #include "breeze/scheduler.h"
@@ -123,31 +124,50 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
                 Item & item = items[index];
                 if (!item.error.empty()) continue;
                 const auto item_started = Clock::now();
+                const auto request_log = log_speech_request("HTTP batch/" + item.id, options.model,
+                    item.selection, item.speech.voice, item.speech.g, parallel);
                 try {
                     RequestExecution permit(execution_queue, parallel, scheduler.cost(item.speech.g.cfg_scale),
-                                             request.is_connection_closed);
-                    if (!permit.acquired()) return;
-                    auto lease = models.acquire(item.selection, item.status, item.error, request.is_connection_closed);
-                    if (!lease) continue;
+                                             request.is_connection_closed,
+                                             [&] { log_speech_event(request_log, "排队等待"); });
+                    if (!permit.acquired()) {
+                        log_speech_event(request_log, "已取消");
+                        item.status = 499;
+                        item.error = "request cancelled";
+                        continue;
+                    }
+                    item.speech.g.cancelled = permit.cancellation();
+                    auto lease = models.acquire(item.selection, item.status, item.error, item.speech.g.cancelled);
+                    if (!lease) {
+                        log_speech_event(request_log, "加载失败：" + item.error);
+                        continue;
+                    }
                     item.speech.g.lora_id = lease->slot();
+                    log_speech_event(request_log, "开始推理");
                     std::string sent, content_type;
                     auto encoder = make_encoder("wav", model.cfg.sample_rate, sent, content_type);
                     encoder->begin(item.audio);
                     GenTimings timings;
                     generate(model, codec, item.speech.g, [&](const float * samples, int count) {
-                        if (request.is_connection_closed()) return false;
+                        if (permit.cancelled()) return false;
                         if (!item.samples) item.first_audio_ms = elapsed_ms(item_started);
                         encoder->write(samples, count, item.audio);
                         item.samples += (size_t) count;
                         return true;
                     }, &timings, &scheduler);
                     encoder->finish(item.audio);
-                    if (!item.samples) {
+                    if (permit.cancelled()) {
+                        item.status = 499;
+                        item.error = "request cancelled";
+                        item.audio.clear();
+                    } else if (!item.samples) {
                         item.status = 500;
                         item.error = "generation returned no audio";
                         item.audio.clear();
                     } else finish_wav(item.audio);
+                    log_speech_event(request_log, item.error.empty() ? "生成完成" : item.error);
                 } catch (const std::exception & error) {
+                    log_speech_event(request_log, std::string("生成失败：") + error.what());
                     item.status = 500;
                     item.error = error.what();
                     item.audio.clear();

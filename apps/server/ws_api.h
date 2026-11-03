@@ -18,6 +18,6 @@ namespace breeze {
 // waits its turn rather than being turned away
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
                    GenScheduler & sched, Models & models, RequestQueue & execution_queue,
-                   int chunk_first, int chunk_max, int split_chars);
+                   int chunk_first, int chunk_max, int split_chars, const std::string & base_model);
 
 } // namespace breeze

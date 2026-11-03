@@ -12,7 +12,8 @@
 namespace breeze {
 
 struct DepthStep {
-    Graph graph{2048};
+    explicit DepthStep(size_t extra_nodes = 0) : graph(2048 + extra_nodes) {}
+    Graph graph;
     ggml_tensor * audio = nullptr;
     ggml_tensor * hidden = nullptr;
     ggml_tensor * logits = nullptr;
@@ -20,7 +21,8 @@ struct DepthStep {
 
 // every codebook step and its sampling in one graph, so a frame is a single submit and readback
 struct DepthFused {
-    Graph graph{16384};
+    explicit DepthFused(size_t extra_nodes = 0) : graph(16384 + extra_nodes) {}
+    Graph graph;
     ggml_tensor * cb0 = nullptr;
     ggml_tensor * hidden = nullptr;
     ggml_tensor * noise = nullptr;

@@ -61,10 +61,10 @@ def parse_args():
         type=Path,
         action="append",
         default=[],
-        help="additional real LoRA path; repeat to exercise the six-entry LRU",
+        help="additional real LoRA path; repeat to exceed the configured cache capacity",
     )
     parser.add_argument("--cpu", action="store_true")
-    parser.add_argument("--cache-size", type=int, default=6)
+    parser.add_argument("--cache-size", type=int, default=3)
     parser.add_argument("--parallel", type=int, default=4)
     parser.add_argument(
         "--idle-seconds",
@@ -1185,7 +1185,7 @@ def test_lru_capacity(server, report, report_lock, adapter_paths, cache_size):
     if len(candidates) < cache_size + 1:
         report["optional_checks"].append(
             {
-                "name": "six-entry cache evicts the least-recently-used idle adapter",
+                "name": "full cache evicts the least-recently-used idle adapter",
                 "status": "skipped",
                 "details": {
                     "reason": f"need {cache_size + 1} unique LoRA paths, got {len(candidates)}",

@@ -118,6 +118,7 @@ static int first_chunk(const GenPool & pool, int rows, double frame_audio_ms) {
 }
 
 void SpeechJob::start(int other_rows) {
+    if (req.cancelled && req.cancelled()) { stopped = true; return; }
     const ScopedLora selected(m, req.lora_id);
     const bool has_ref = !ref.codes.empty() && !ref.text.empty();
     use_cfg = req.cfg_scale != 1.0f;
@@ -128,6 +129,7 @@ void SpeechJob::start(int other_rows) {
     std::vector<float> emb_u;
     if (use_cfg) emb_u = assemble(m, build_segments(m, req, text, has_ref, ref.text, ref.codes, ref.n_frames, false), total_u);
     tm.prompt += ms_since(t0);
+    if (req.cancelled && req.cancelled()) { stopped = true; return; }
 
     max_new = req.max_new_tokens > 0 ? req.max_new_tokens : m.cfg.max_new_tokens;
     st_c.init(m, total_c + max_new + 8);
@@ -137,6 +139,7 @@ void SpeechJob::start(int other_rows) {
     o_c = backbone_run(m, st_c, emb_c, total_c);
     if (use_cfg) o_u = backbone_run(m, st_u, emb_u, total_u);
     tm.prefill += ms_since(t0);
+    if (req.cancelled && req.cancelled()) { stopped = true; return; }
 
     bp.temperature = req.temperature > 0.0f ? req.temperature : m.cfg.temperature;
     bp.top_k = req.top_k > 0 ? req.top_k : m.cfg.top_k;
@@ -350,6 +353,7 @@ void GenSession::begin(BreezeModel & m, MimiCodec & codec, const GenRequest & re
 
 bool GenSession::speak(const std::string & text, const AudioCallback & cb, GenTimings * tm) {
     if (!m_model || !m_codec) return false;
+    if (m_req.cancelled && m_req.cancelled()) return false;
     GenTimings sink;
     GenTimings & t = tm ? *tm : sink;
 
@@ -366,7 +370,10 @@ bool GenSession::speak(const std::string & text, const AudioCallback & cb, GenTi
     } else {
         job.start();
         const std::vector<SpeechJob *> one = { &job };
-        while (job.wants_frame()) step_jobs(*m_model, m_pool, one);
+        while (job.wants_frame()) {
+            if (m_req.cancelled && m_req.cancelled()) { job.stopped = true; break; }
+            step_jobs(*m_model, m_pool, one);
+        }
         job.finish();
         ok = !job.stopped;
     }
@@ -447,6 +454,7 @@ static std::string filler_text(double secs) {
 std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::vector<int> & src_codes,
                                  int src_T, const std::vector<float> & ref_audio,
                                  const std::string & ref_text, const ConvertOptions & opt) {
+    if (opt.cancelled && opt.cancelled()) return {};
     const int nc = m.cfg.num_codebooks;
     const bool use_cfg = opt.cfg_scale != 1.0f;
     std::mt19937 rng((uint32_t) opt.seed);
@@ -489,6 +497,7 @@ std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::
     std::vector<int> out((size_t) src_T * nc);
     const int keep = opt.keep_acoustic < nc - 1 ? opt.keep_acoustic : nc - 1;
     for (int t = 0; t < src_T; t++) {
+        if (opt.cancelled && opt.cancelled()) break;
         const int cb0 = src_codes[(size_t) t * nc];
         std::vector<std::vector<float>> hiddens = { o_c.hidden };
         if (use_cfg) hiddens.push_back(o_u.hidden);
@@ -515,6 +524,7 @@ std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::
     st_c.free();
     if (use_cfg) st_u.free();
     depth.free();
+    if (opt.cancelled && opt.cancelled()) return {};
 
     // the vocoder upsamples 1920x, so decoding a long clip in one graph asks for gigabytes at once
     const int step = 40;
@@ -523,6 +533,7 @@ std::vector<float> convert_voice(BreezeModel & m, MimiCodec & codec, const std::
     std::vector<float> audio;
     audio.reserve((size_t) src_T * m.cfg.samples_per_frame);
     for (int start = 0; start < src_T; start += step) {
+        if (opt.cancelled && opt.cancelled()) return {};
         const int count = std::min(step, src_T - start);
         std::vector<int> sub(out.begin() + (size_t) start * nc, out.begin() + (size_t) (start + count) * nc);
         std::vector<float> part = voc.decode(sub, count);

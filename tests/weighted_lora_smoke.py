@@ -65,9 +65,10 @@ def main():
         require(mixed == speak(extra_loras=extras), "A-B-A stack switching contaminates generation")
         before = server.models()["lora_cache"]
         require(before["loaded"] == 2, "two-LoRA stack does not use two resident files")
+        require(before["weighted_compositions"] == 0, "idle weighted graph was retained")
         require(mixed == speak(extra_loras=extras), "reused stack changes output")
-        require(server.models()["lora_cache"] == before, "same stack creates extra cache entries")
-        report["checks"].append("role + ASMR 1.8, role 0, A-B-A isolation and graph reuse")
+        require(server.models()["lora_cache"] == before, "completed stack leaves extra cache entries")
+        report["checks"].append("role + ASMR 1.8, role 0, A-B-A isolation and immediate idle graph release")
 
         with connect(server.ws_url, proxy=None, open_timeout=30) as ws:
             ws.recv(timeout=30)
@@ -111,11 +112,14 @@ def main():
         report["checks"].append("parallel batch uses per-item weights")
 
         for invalid in ({"lora_weight": "-1"}, {"lora_weight": "NaN"}, {"extra_loras": "{}"},
-                        {"extra_loras": json.dumps([{"lora_path": str(args.role.resolve())}])},
-                        {"extra_loras": json.dumps(extras + [{"lora_path": str(out / 'third.gguf')}])}):
+                        {"extra_loras": json.dumps([{"lora_path": str(args.role.resolve())}])}):
             response = session.post(server.url + "/v1/audio/speech", data={**common, **invalid}, timeout=20)
             require(response.status_code == 400, f"invalid stack accepted: {invalid}")
-        report["checks"].append("invalid weights, duplicate paths and oversized stacks rejected")
+        missing = session.post(server.url + "/v1/audio/speech", data={**common,
+            "extra_loras": json.dumps(extras + [{"lora_path": str(out / 'third.gguf')}])}, timeout=20)
+        require(missing.status_code == 422, "missing overflow adapter did not report a load failure")
+        require(server.models()["lora_cache"]["temporary_loaded"] == 0, "failed load retained an idle temporary adapter")
+        report["checks"].append("invalid weights and duplicate paths rejected; missing overflow file reports load failure")
         started = time.monotonic()
         full = speak(extra_loras=extras, max_new_tokens="600")
         save_pcm(out / "角色1.0_ASMR1.8_原生叠加验证.wav", full, 24000)

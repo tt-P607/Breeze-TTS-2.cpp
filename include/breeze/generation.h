@@ -16,6 +16,7 @@
 namespace breeze {
 
 struct GenRequest {
+    std::function<bool()> cancelled; // checked between generation frames, independent of PCM chunk size
     std::string lora_id; // internal adapter slot, empty selects the base weights
     std::string text;
     std::string instruction = "Speak clearly and naturally.";
@@ -61,6 +62,7 @@ double estimate_seconds(const std::string & text);
 // how faithfully the acoustic codes are resynthesised. codec language models are known to go
 // unstable on random sampling, so conversion leans much harder on the likeliest codes than tts does
 struct ConvertOptions {
+    std::function<bool()> cancelled;
     std::string src_text;   // transcript of the source, empty generates filler
     float temperature = 0.3f;
     int top_k = 1;
@@ -179,6 +181,14 @@ private:
 // one frame for every job, in as few gpu passes as they can share
 void step_jobs(BreezeModel & m, GenPool & pool, const std::vector<SpeechJob *> & jobs);
 
+// State needed to continue one streaming session after a controlled model restart.
+struct GenSessionCheckpoint {
+    std::vector<int> codes;
+    std::string text;
+    int frames = 0;
+    uint32_t piece = 0;
+};
+
 // text that arrives a bit at a time, the reference and play clock carry over between pieces
 class GenSession {
 public:
@@ -190,9 +200,18 @@ public:
 
     void set_instruction(const std::string & s) { m_req.instruction = s; }
     void set_lora(const std::string & id) { m_req.lora_id = id; }
+    void set_cancelled(std::function<bool()> cancelled) { m_req.cancelled = std::move(cancelled); }
 
     // with no clip to clone the first piece becomes the reference, so it wants to stay short
     bool needs_anchor() const { return m_codes.empty(); }
+
+    GenSessionCheckpoint checkpoint() const { return {m_codes, m_text, m_frames, m_piece}; }
+    void restore_checkpoint(const GenSessionCheckpoint & state) {
+        m_codes = state.codes;
+        m_text = state.text;
+        m_frames = state.frames;
+        m_piece = state.piece;
+    }
 
 private:
     BreezeModel * m_model = nullptr;

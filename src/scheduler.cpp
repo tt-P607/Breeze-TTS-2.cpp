@@ -103,7 +103,9 @@ bool GenScheduler::run(SpeechJob & job) {
 
     std::unique_lock<std::mutex> lock(m_mu);
     for (;;) {
-        e.cv.wait(lock, [&] { return e.done || !e.audio.empty(); });
+        e.cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return e.done || !e.audio.empty(); });
+        if (job.req.cancelled && job.req.cancelled()) e.cancel = true;
+        if (!e.done && e.audio.empty()) continue;
         if (e.audio.empty()) break;
         std::vector<float> chunk = std::move(e.audio.front());
         e.audio.pop_front();
@@ -173,7 +175,9 @@ void GenScheduler::loop() {
 
         if (fresh) {
             try {
-                fresh->job->start(other_rows);
+                if (fresh->cancel || (fresh->job->req.cancelled && fresh->job->req.cancelled()))
+                    fresh->job->stopped = true;
+                else fresh->job->start(other_rows);
                 m_active.push_back(fresh);
             } catch (...) {
                 finish(*fresh, std::current_exception());
@@ -182,7 +186,7 @@ void GenScheduler::loop() {
 
         std::map<std::string, std::vector<SpeechJob *>> batches;
         for (Entry * e : m_active) {
-            if (e->cancel) e->job->stopped = true;
+            if (e->cancel || (e->job->req.cancelled && e->job->req.cancelled())) e->job->stopped = true;
             if (e->job->wants_frame()) batches[e->job->req.lora_id].push_back(e->job);
         }
         std::map<std::string, std::exception_ptr> failed;

@@ -81,6 +81,7 @@ WsConn::~WsConn() { close(); }
 
 void WsConn::close() {
     if (m_closed.exchange(true)) return;
+    brz_shutdown(m_sock);
     brz_close((SOCKET) m_sock);
 }
 

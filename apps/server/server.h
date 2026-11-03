@@ -9,7 +9,7 @@ struct ServerOptions {
     std::string model;
     std::string model_id = "default";
     std::map<std::string, std::string> switchable_loras;
-    int lora_cache_size = 6;
+    int lora_cache_size = 3;
     int lora_idle_seconds = 900;
     std::string host = "127.0.0.1";
     int port = 8080;

@@ -46,7 +46,7 @@ breeze-server <model.gguf> [--host H] [--port P] [--webui] [--cpu]
 | `--parallel` | `1` | Streams generating at once. A stream using guidance counts as two. See [performance.md](performance.md#running-several-streams). |
 | `--model-id` | `default` | ID of the initial full model. |
 | `--switchable-lora ID=PATH` | none | Register a LoRA adapter without loading it. See [lora.md](lora.md). |
-| `--lora-cache-size` | `6` | Maximum number of resident LoRA adapters. The base model is shared. |
+| `--lora-cache-size` | `3` | Adapters retained between requests. Busy overflow is allowed and unloaded after its last user finishes. The base model is shared. |
 | `--lora-idle-seconds` | `900` | Unload an adapter after this many seconds without a request using it. |
 
 ```
@@ -629,3 +629,14 @@ The assets are compiled into the binary at build time from the
 [webui](../webui) folder by `cmake/embed_webui.cmake`, so there is no static
 directory to deploy. Editing a file there and rebuilding is enough to pick up
 changes.
+
+## Request logs
+
+Speech requests print a numbered block to stdout with the full text, instruction,
+base GGUF path, selected model ID, nonzero LoRA paths and weights, reference
+voice ID, execution mode, CFG and seed. Queue, inference and terminal events
+reuse that number and include elapsed time. WebSocket text is logged per spoken
+piece with the instruction captured for that piece; batch items have separate
+numbers. These logs are always enabled and flushed immediately, so they also
+appear when the server is hosted by a process manager. Control characters are
+escaped; Chinese text is kept readable.

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <future>
 
 using namespace breeze;
@@ -95,6 +96,42 @@ static void cancellation(RequestQueue & queue) {
     require(next.acquired(), "cancelled ticket or slots leaked into the next request");
 }
 
+static void global_cancellation(RequestQueue & queue) {
+    RequestExecution active(queue, true, 1);
+    require(active.acquired(), "global cancel test could not acquire its active permit");
+    const auto active_cancelled = active.cancellation();
+
+    Event queued;
+    auto pending = std::async(std::launch::async, [&] {
+        RequestExecution permit(queue, true, 2, {}, [&] { queued.signal(); });
+        return std::make_pair(permit.acquired(), permit.cancellation());
+    });
+    require(queued.wait(), "global cancel test did not queue the second permit");
+
+    queue.cancel_all();
+    require(active.cancelled() && active_cancelled(), "global cancel did not mark an active permit cancelled");
+    require(pending.wait_for(500ms) == std::future_status::ready,
+            "global cancel did not wake a queued permit");
+    auto [acquired, queued_cancelled] = pending.get();
+    require(!acquired, "global cancel admitted a queued permit");
+    require(queued_cancelled(), "global cancel did not mark a queued permit cancelled");
+
+    RequestExecution rejected(queue, true, 1);
+    require(!rejected.acquired(), "global cancel admitted a new request while paused");
+
+    queue.resume();
+    require(active_cancelled() && queued_cancelled(), "resume restored an old permit cancellation token");
+
+    active.release();
+    auto next = std::async(std::launch::async, [&] {
+        RequestExecution permit(queue, true, 2);
+        return permit.acquired();
+    });
+    require(next.wait_for(500ms) == std::future_status::ready,
+            "cancelled queue entry or slot leaked after resume");
+    require(next.get(), "a full-capacity request was not admitted after resume");
+}
+
 int main() {
     BreezeModel model;
     GenScheduler scheduler;
@@ -108,6 +145,7 @@ int main() {
         serial_barrier(queue);
         weighted_slots(queue);
         cancellation(queue);
+        global_cancellation(queue);
     }
     require(scheduler.try_acquire(2), "request permits leaked generation slots");
     scheduler.release(2);

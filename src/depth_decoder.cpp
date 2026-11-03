@@ -98,7 +98,8 @@ static std::unique_ptr<DepthStep> build_depth_step(BreezeModel & m, DepthRunner 
     const int n_pos = head_idx == 0 ? 2 : 1;
     const int n_tok = n_pos * nb;
     const int total = (start + n_pos) * nb;
-    auto step = std::make_unique<DepthStep>();
+    const size_t extra_nodes = 4 * m.active_loras.size() * (7 * (size_t) c.n_layer + 1);
+    auto step = std::make_unique<DepthStep>(extra_nodes);
     Graph & g = step->graph;
 
     step->audio = g.input_i32(std::vector<int32_t>(nb), nb);
@@ -141,7 +142,9 @@ static std::unique_ptr<DepthFused> build_depth_fused(BreezeModel & m, DepthRunne
     const int nc = m.cfg.num_codebooks;
     const int vs = m.cfg.audio_vocab_size;
     const int hs = m.cfg.hidden_size;
-    auto f = std::make_unique<DepthFused>();
+    // Each adapter adds four operations per projection, repeated for every codebook head.
+    const size_t extra_nodes = 4 * m.active_loras.size() * (7 * (size_t) c.n_layer + 1) * (nc - 1);
+    auto f = std::make_unique<DepthFused>(extra_nodes);
     f->top_k = top_k;
     Graph & g = f->graph;
     ggml_context * ctx = g.ctx;

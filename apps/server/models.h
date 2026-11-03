@@ -75,6 +75,7 @@ private:
         std::string slot;
         std::size_t users = 0;
         std::chrono::steady_clock::time_point last_used;
+        bool temporary = false;
     };
     struct Stack {
         Entry cache;
@@ -86,7 +87,8 @@ private:
     static std::string escape_json(const std::string & value);
 
     void release(const std::vector<std::string> & paths, const std::string & slot, bool base);
-    void trim_stacks_locked();
+    void release_unused_stacks_locked();
+    void release_temporary_locked();
     void unload_locked(const std::string & path, const Entry & entry);
     void reaper_loop();
 
@@ -96,10 +98,9 @@ private:
     const int m_idle_timeout_seconds;
 
     mutable std::mutex m_mutex;
-    std::condition_variable m_available;
     std::map<std::string, std::string> m_registered; // model ID -> normalized path; base ID has an empty path
     std::map<std::string, Entry> m_cache;             // normalized path -> resident adapter
-    std::map<std::string, Stack> m_stacks;             // weighted composition -> bounded graph cache
+    std::map<std::string, Stack> m_stacks;             // weighted composition -> in-use graph cache
     std::map<std::string, std::chrono::steady_clock::time_point> m_last_used;
     std::string m_base_id;
     std::string m_default_id;

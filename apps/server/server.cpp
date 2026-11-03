@@ -4,6 +4,7 @@
 #include "json.h"
 #include "models.h"
 #include "openai.h"
+#include "request_log.h"
 #include "voices.h"
 #include "batch.h"
 #include "ws.h"
@@ -25,7 +26,9 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace breeze {
@@ -78,7 +81,7 @@ static void fail(httplib::Response & res, int status, const std::string & messag
 }
 
 // one generation with the console progress bar, emit gets each decoded chunk and false stops it
-static void run_generation(BreezeModel & model, MimiCodec & codec, GenScheduler & sched, const GenRequest & g, int sr,
+static bool run_generation(BreezeModel & model, MimiCodec & codec, GenScheduler & sched, const GenRequest & g, int sr,
                            bool verbose, const AudioCallback & emit) {
     GenTimings tm;
     const auto t0 = std::chrono::steady_clock::now();
@@ -88,6 +91,7 @@ static void run_generation(BreezeModel & model, MimiCodec & codec, GenScheduler 
     // the model decides when to stop, so the total is only ever an estimate
     const double est = estimate_seconds(g.text);
     size_t total = 0;
+    bool success = true;
     try {
         generate(model, codec, g, [&](const float * s, int n) {
             if (!emit(s, n)) return false;
@@ -105,6 +109,7 @@ static void run_generation(BreezeModel & model, MimiCodec & codec, GenScheduler 
             return true;
         }, &tm, &sched);
     } catch (const std::exception & e) {
+        success = false;
         fprintf(stderr, "\ngeneration error: %s\n", e.what());
     }
     const double secs = (double) total / sr, wall = elapsed();
@@ -120,6 +125,7 @@ static void run_generation(BreezeModel & model, MimiCodec & codec, GenScheduler 
                tm.depth / tm.frames, tm.vocoder / tm.frames);
     }
     fflush(stdout);
+    return success && total > 0;
 }
 
 int run_server(const ServerOptions & opts) {
@@ -160,14 +166,90 @@ int run_server(const ServerOptions & opts) {
 
     // Declare the server after Models so its workers are destroyed before their cache manager.
     httplib::Server svr;
+    std::mutex admission_mutex;
+    bool draining = false;
+    std::unordered_set<WsConn *> websocket_sessions;
+    std::unordered_set<const httplib::Request *> admitted_http;
+    svr.set_pre_routing_handler([&](const httplib::Request & req, httplib::Response & res) {
+        if (req.path.rfind("/__gpu_audio/", 0) == 0) return httplib::Server::HandlerResponse::Unhandled;
+        std::lock_guard<std::mutex> lock(admission_mutex);
+        const bool safe_read = req.method == "GET" &&
+            (req.path == "/health" || req.path == "/v1/models" || req.path == "/v1/voices");
+        if (draining && !safe_read) {
+            res.status = 503;
+            res.set_content("{\"error\":\"service draining\"}", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        admitted_http.insert(&req);
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+    svr.set_post_routing_handler([&](const httplib::Request & req, httplib::Response & res) {
+        {
+            std::lock_guard<std::mutex> lock(admission_mutex);
+            admitted_http.erase(&req);
+        }
+        if (opts.cors.empty()) return;
+        const std::string origin = cors_origin(opts.cors, req);
+        if (origin.empty()) return;
+        res.set_header("Access-Control-Allow-Origin", origin);
+        res.set_header("Access-Control-Expose-Headers", "X-Sample-Rate, X-Sample-Format");
+        if (origin != "*") res.set_header("Vary", "Origin");
+    });
+    svr.Post("/__gpu_audio/drain", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!loopback_peer(req.remote_addr)) return fail(res, 403, "localhost only");
+        std::lock_guard<std::mutex> lock(admission_mutex);
+        draining = true;
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+    svr.Post("/__gpu_audio/resume", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!loopback_peer(req.remote_addr)) return fail(res, 403, "localhost only");
+        std::lock_guard<std::mutex> lock(admission_mutex);
+        draining = false;
+        execution_queue.resume();
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+    svr.Post("/__gpu_audio/cancel", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!loopback_peer(req.remote_addr)) return fail(res, 403, "localhost only");
+        std::lock_guard<std::mutex> lock(admission_mutex);
+        draining = true;
+        execution_queue.cancel_all();
+        for (WsConn * connection : websocket_sessions) connection->close();
+        res.set_content("{\"ok\":true}", "application/json");
+    });
+    svr.Get("/__gpu_audio/idle", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!loopback_peer(req.remote_addr)) return fail(res, 403, "localhost only");
+        std::lock_guard<std::mutex> lock(admission_mutex);
+        const auto activity = execution_queue.activity();
+        res.set_content("{\"draining\":" + std::string(draining ? "true" : "false") +
+                        ",\"http\":" + std::to_string(admitted_http.size()) +
+                        ",\"websockets\":" + std::to_string(websocket_sessions.size()) +
+                        ",\"active\":" + std::to_string(activity.first) +
+                        ",\"waiting\":" + std::to_string(activity.second) + "}", "application/json");
+    });
     store.add_routes(svr, model, codec, sched, execution_queue, opts.voices_dir);
 
     WsServer ws;
     const int ws_port = opts.ws_port == 0 ? opts.port + 1 : opts.ws_port;
     if (ws_port > 0) {
         const bool up = ws.start(opts.host, ws_port, [&](WsConn & c) {
-            ws_connection(c, model, codec, store, sched, models, execution_queue,
-                          opts.chunk_first, opts.chunk_max, opts.split_chars);
+            {
+                std::lock_guard<std::mutex> lock(admission_mutex);
+                if (draining) {
+                    c.send_text("{\"type\":\"error\",\"message\":\"service draining\"}");
+                    return;
+                }
+                websocket_sessions.insert(&c);
+            }
+            try {
+                ws_connection(c, model, codec, store, sched, models, execution_queue,
+                              opts.chunk_first, opts.chunk_max, opts.split_chars, opts.model);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(admission_mutex);
+                websocket_sessions.erase(&c);
+                throw;
+            }
+            std::lock_guard<std::mutex> lock(admission_mutex);
+            websocket_sessions.erase(&c);
         });
         if (up) printf("websocket on ws://%s:%d\n", opts.host.c_str(), ws_port);
         else fprintf(stderr, "could not open the websocket port %d\n", ws_port);
@@ -273,16 +355,25 @@ int run_server(const ServerOptions & opts) {
             return;
         }
         const int cost = sched.cost(o.g.cfg_scale);
-        auto permit = std::make_shared<RequestExecution>(execution_queue, o.parallel, cost, req.is_connection_closed);
-        if (!permit->acquired()) { res.status = 499; return; }
-        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, req.is_connection_closed);
+        const auto request_log = log_speech_request("HTTP JSON", opts.model, selection, o.voice, o.g, o.parallel);
+        auto permit = std::make_shared<RequestExecution>(execution_queue, o.parallel, cost, req.is_connection_closed,
+            [&] { log_speech_event(request_log, "排队等待"); });
+        if (!permit->acquired()) {
+            log_speech_event(request_log, "已取消");
+            res.status = 499;
+            return;
+        }
+        o.g.cancelled = permit->cancellation();
+        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, o.g.cancelled);
         if (!lease) {
+            log_speech_event(request_log, "加载失败：" + error);
             res.status = status;
             res.set_content(openai_error(error, status == 409 || status == 422 ? "server_error" : "invalid_request_error"),
                             "application/json");
             return;
         }
         o.g.lora_id = lease->slot();
+        log_speech_event(request_log, "开始推理");
         o.g.chunk_first = opts.chunk_first;
         o.g.chunk_max = opts.chunk_max;
         std::string sent, ctype;
@@ -300,23 +391,24 @@ int run_server(const ServerOptions & opts) {
         fflush(stdout);
 
         res.set_chunked_content_provider(
-            ctype, [&model, &codec, &sched, g = o.g, sse = o.sse, enc, lease, permit, sr, verbose = opts.verbose](
+            ctype, [&model, &codec, &sched, g = o.g, sse = o.sse, enc, lease, permit, request_log, sr, verbose = opts.verbose](
                        size_t, httplib::DataSink & sink) {
                 std::string buf;
                 const auto flush = [&] {
                     if (buf.empty()) return true;
                     const std::string out = sse ? sse_audio_delta(buf) : buf;
                     buf.clear();
-                    return sink.write(out.data(), out.size());
+                    return !permit->cancelled() && sink.write(out.data(), out.size());
                 };
                 enc->begin(buf);
-                if (flush()) {
-                    bool alive = true;
-                    run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
+                bool alive = flush();
+                bool generated = false;
+                if (alive) {
+                    generated = run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
                         enc->write(s, n, buf);
                         return alive = flush();
                     });
-                    if (alive) {
+                    if (alive && !permit->cancelled()) {
                         enc->finish(buf);
                         if (flush() && sse) {
                             const std::string done = sse_audio_done();
@@ -324,6 +416,8 @@ int run_server(const ServerOptions & opts) {
                         }
                     }
                 }
+                log_speech_event(request_log, permit->cancelled() || !alive ? "已取消或连接断开" :
+                                 (generated ? "生成完成" : "生成失败"));
                 sink.done();
                 return true;
             });
@@ -358,10 +452,21 @@ int run_server(const ServerOptions & opts) {
         if (execution != "serial" && execution != "parallel")
             return fail(res, 400, "execution must be serial or parallel");
         const int cost = sched.cost(g.cfg_scale);
-        auto permit = std::make_shared<RequestExecution>(execution_queue, execution == "parallel", cost, req.is_connection_closed);
-        if (!permit->acquired()) { res.status = 499; return; }
-        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, req.is_connection_closed);
-        if (!lease) return fail(res, status, error);
+        const auto request_log = log_speech_request("HTTP 表单", opts.model, selection,
+                                                   field(req, "voice_id", ""), g, execution == "parallel");
+        auto permit = std::make_shared<RequestExecution>(execution_queue, execution == "parallel", cost, req.is_connection_closed,
+            [&] { log_speech_event(request_log, "排队等待"); });
+        if (!permit->acquired()) {
+            log_speech_event(request_log, "已取消");
+            res.status = 499;
+            return;
+        }
+        g.cancelled = permit->cancellation();
+        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, g.cancelled);
+        if (!lease) {
+            log_speech_event(request_log, "加载失败：" + error);
+            return fail(res, status, error);
+        }
         g.lora_id = lease->slot();
         if (req.has_file("ref_audio")) {
             const auto & f = req.get_file_value("ref_audio");
@@ -394,6 +499,7 @@ int run_server(const ServerOptions & opts) {
             }
             // without this a bad clip quietly turns a clone into voice design
             if (!f.content.empty() && g.ref_codes.empty() && g.ref_audio.empty()) {
+                log_speech_event(request_log, "参考音频读取失败");
                 res.status = 400;
                 res.set_content("{\"error\":\"could not read ref_audio\"}", "application/json");
                 return;
@@ -401,6 +507,7 @@ int run_server(const ServerOptions & opts) {
         }
         const std::string vid = field(req, "voice_id", "");
         if (!vid.empty() && !store.take(vid, g.ref_codes, g.ref_frames, g.ref_text)) {
+            log_speech_event(request_log, "音色不存在：" + vid);
             res.status = 404;
             res.set_content("{\"error\":\"unknown voice_id\"}", "application/json");
             return;
@@ -420,14 +527,18 @@ int run_server(const ServerOptions & opts) {
         const char * mode = has_ref ? (sent_ins ? "direction" : "clone") : "design";
         printf("gen  %s, %d chars, cfg %.1f, seed %d\n", mode, (int) g.text.size(), g.cfg_scale, g.seed);
         fflush(stdout);
+        log_speech_event(request_log, "开始推理");
 
         res.set_chunked_content_provider(
             "audio/pcm",
-            [&model, &codec, &sched, g, lease, permit, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
-                run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
+            [&model, &codec, &sched, g, lease, permit, request_log, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
+                bool alive = true;
+                const bool generated = run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
                     const std::vector<uint8_t> pcm = to_pcm16(s, n);
-                    return sink.write((const char *) pcm.data(), pcm.size());
+                    return alive = !permit->cancelled() && sink.write((const char *) pcm.data(), pcm.size());
                 });
+                log_speech_event(request_log, permit->cancelled() || !alive ? "已取消或连接断开" :
+                                 (generated ? "生成完成" : "生成失败"));
                 sink.done();
                 return true;
             });
@@ -471,16 +582,33 @@ int run_server(const ServerOptions & opts) {
         int status = 0;
         std::string error;
         if (!select_form_model(req, selection, status, error)) return fail(res, status, error);
-        RequestExecution permit(execution_queue, false, sched.parallel(), req.is_connection_closed);
-        if (!permit.acquired()) { res.status = 499; return; }
-        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, req.is_connection_closed);
-        if (!lease) return fail(res, status, error);
+        GenRequest log_parameters;
+        log_parameters.text = field(req, "text", "");
+        log_parameters.instruction.clear();
+        log_parameters.cfg_scale = (float) atof(field(req, "cfg_scale", "1.0").c_str());
+        log_parameters.seed = atoi(field(req, "seed", "42").c_str());
+        const auto request_log = log_speech_request("HTTP 音色转换", opts.model, selection, vid,
+                                                   log_parameters, false);
+        RequestExecution permit(execution_queue, false, sched.parallel(), req.is_connection_closed,
+            [&] { log_speech_event(request_log, "排队等待"); });
+        if (!permit.acquired()) {
+            log_speech_event(request_log, "已取消");
+            res.status = 499;
+            return;
+        }
+        std::shared_ptr<Models::Lease> lease = models.acquire(selection, status, error, permit.cancellation());
+        if (!lease) {
+            log_speech_event(request_log, "加载失败：" + error);
+            return fail(res, status, error);
+        }
+        log_speech_event(request_log, "开始转换");
 
         printf("conv %.2f s source, %s\n", (double) src.size() / sr,
                vframes > 0 ? "cached reference" : "uploaded reference");
         fflush(stdout);
         try {
             ConvertOptions copt;
+            copt.cancelled = permit.cancellation();
             copt.src_text = field(req, "text", "");
             copt.temperature = (float) atof(field(req, "temperature", "0.3").c_str());
             copt.top_k = atoi(field(req, "top_k", "1").c_str());
@@ -503,6 +631,10 @@ int run_server(const ServerOptions & opts) {
                     audio = convert_voice(model, codec, codes, T, ref, ref_text, copt);
                 }
             });
+            if (permit.cancelled()) {
+                log_speech_event(request_log, "已取消");
+                return fail(res, 499, "request cancelled");
+            }
             const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             const double secs = (double) audio.size() / sr;
             printf("     %.2f s in %.2f s, %.2fx rt\n", secs, wall, wall > 0 ? secs / wall : 0.0);
@@ -511,7 +643,9 @@ int run_server(const ServerOptions & opts) {
             res.set_header("X-Sample-Rate", std::to_string(sr));
             res.set_header("X-Sample-Format", "s16le");
             res.set_content((const char *) pcm.data(), pcm.size(), "audio/pcm");
+            log_speech_event(request_log, "转换完成");
         } catch (const std::exception & e) {
+            log_speech_event(request_log, std::string("转换失败：") + e.what());
             fprintf(stderr, "conversion error: %s\n", e.what());
             res.status = 500;
             res.set_content("{\"error\":\"conversion failed\"}", "application/json");
@@ -532,14 +666,6 @@ int run_server(const ServerOptions & opts) {
     }
 
     if (!opts.cors.empty()) {
-        // post routing hits every response, errors and the chunked stream included
-        svr.set_post_routing_handler([&](const httplib::Request & req, httplib::Response & res) {
-            const std::string origin = cors_origin(opts.cors, req);
-            if (origin.empty()) return;
-            res.set_header("Access-Control-Allow-Origin", origin);
-            res.set_header("Access-Control-Expose-Headers", "X-Sample-Rate, X-Sample-Format");
-            if (origin != "*") res.set_header("Vary", "Origin");
-        });
         // an origin off the list still gets a 204, just without the header, so the browser refuses it
         svr.Options(".*", [](const httplib::Request & req, httplib::Response & res) {
             res.set_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");

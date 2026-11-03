@@ -30,7 +30,7 @@ rank 从权重形状读取，实际缩放值为 alpha/rank。需要手动指定�
       --switchable-lora voice-a=adapters/voice-a.gguf \
       --switchable-lora voice-b=adapters/voice-b.gguf \
       --switchable-lora voice-c=adapters/voice-c.gguf \
-      --lora-cache-size 6 --lora-idle-seconds 900
+      --lora-cache-size 3 --lora-idle-seconds 900
 
 底模先加载，启动参数只登记 LoRA 路径，收到请求时才加载。启动注册路径可以是相对路径。
 底模必须与训练这些 LoRA 时所用的模型匹配，仅有相同文件后缀或相同大小并不足够。
@@ -41,7 +41,7 @@ rank 从权重形状读取，实际缩放值为 alpha/rank。需要手动指定�
 {
   "object": "list",
   "active_model": "base",
-  "lora_cache": {"capacity": 6, "idle_timeout_seconds": 900, "loaded": 0},
+  "lora_cache": {"capacity": 3, "idle_timeout_seconds": 900, "loaded": 0, "temporary_loaded": 0, "weighted_compositions": 0},
   "data": [
     {"id": "base", "object": "model", "loaded": true, "in_use": false, "idle_seconds": 0},
     {"id": "voice-a", "object": "model", "loaded": false, "in_use": false, "idle_seconds": 0}
@@ -67,7 +67,7 @@ WebSocket 在 `start` 消息中使用 `model_id`、可选的 `lora_path` 和 `ex
 没有显式模型字段时使用当前默认 ID。`lora_path` 必须是服务端本机绝对路径，且只接受来自 localhost 的请求；
 只提供路径时该请求直接使用它，不创建注册 ID。与 `model_id` 同时提供时，成功加载后才登记或更新该 ID 的路径。
 未知 ID、无效路径、
-加载失败和缓存全部被占用都会明确报错，不会回退到默认模型或裸底模。
+加载失败都会明确报错，不会回退到默认模型或裸底模；缓存满不会阻止加载新的适配器。
 
 `POST /v1/models/active` 仍只允许本机调用。它只设置后续未显式选模型请求的默认 ID，
 不会改变正在运行的 HTTP 请求或已开始的 WebSocket 会话：
@@ -79,10 +79,14 @@ WebSocket 在 `start` 消息中使用 `model_id`、可选的 `lora_path` 和 `ex
 该接口也能用 `{"model_id":"voice-d","lora_path":"E:\\models\\voice-d.gguf"}` 注册本机 LoRA 并设为默认；
 注册只在加载成功后生效。返回 `changed` 表示默认 ID 是否改变。
 
-`--lora-cache-size N` 控制最多保留的 LoRA 数量（默认 6）；`--lora-idle-seconds N` 设置空闲卸载时间（默认 900 秒）。
+`--lora-cache-size N` 控制请求之间最多保留的 LoRA 数量（默认 3），不是正在使用数量的硬上限。
+`--lora-idle-seconds N` 设置普通缓存的空闲卸载时间（默认 900 秒）。
 缓存后台定时清理空闲 LoRA，未被请求使用的默认 LoRA 也会卸载；下次请求会自动重新加载。
-HTTP 租约保持到整个流式响应结束，WebSocket 每段生成单独持有租约。缓存满且所有 LoRA 都在使用时，
-新的适配器请求等待缓存租约释放。服务先腾出最久未使用的空闲项，再加载新文件，不会淘汰正在使用的权重。加载失败会报错，已腾出的空闲项下次使用时重新加载。
+HTTP 租约保持到整个流式响应结束，WebSocket 每段生成单独持有租约。加载前先淘汰最久未使用的空闲项，
+不会卸载正在使用或本次请求需要的权重。空闲项不足时允许临时超出缓存上限，不因缓存满而等待。
+超额加载的权重标为临时项，最后一个使用它的请求结束后立即卸载，即便其他普通缓存已经空闲也不会转为常驻。
+`loaded` 是实际已加载总数，`temporary_loaded` 是其中的临时项数量；忙时前者可以超过 `capacity`，
+临时请求结束后恢复到缓存上限内。加载失败会报错，未使用的临时项立即清理，已腾出的空闲项下次使用时重新加载。
 
 ## 请求权重与效果叠加
 
@@ -107,12 +111,13 @@ HTTP 原生表单将 `extra_loras` 作为 JSON 字符串传入。`/v1/models/act
 权重必须为有限非负数字；`0` 表示本次不加载、不应用该项，`1` 表示原强度，超过 `1` 表示增强。
 允许的数值范围不等于合适的音质范围，应根据训练数据和试听选择。效果 LoRA 需要显式填写，不会自动叠加。
 这些字段不改变参考音频；音色参考仍由 `voice_id` 或参考 WAV/文本决定。
-路径只接受本机请求；同一请求不能重复填写同一个文件，非零 LoRA 总数不能超过 `--lora-cache-size`。
+路径只接受本机请求；同一请求不能重复填写同一个文件。单次叠加也可以超过缓存数量，超额权重按临时项处理。
 
 后端计算底模加各项增量之和，即 `base + Σ(weight × alpha/rank × B(Ax))`。
 每份文件只加载一次，调整权重不生成组合 GGUF、不复制底模。组合的计算图按完整权重列表区分，
-相同列表复用；不同列表并发时分别调度。组合图最多保留与缓存容量相同数量的空闲项，
-正在使用的项保留到请求结束。组合图及其依赖的文件都遵守空闲卸载时间。
+仍在使用相同列表的请求可共享；不同列表并发时分别调度。最后一个请求用完组合后立即释放
+组合图及其推理缓存，不额外保留空闲组合。普通 LoRA 文件权重按缓存上限及空闲时间保留，临时权重用完立即卸载。
+同一角色换不同权重不会不断积累闲置推理缓存；再次使用组合时重新创建计算图。
 
 例如插件可把 ASMR 效果的配置默认值设为 `1.8`；选用 ASMR 但未指定权重时，由插件明确发送 `1.8`。
 这是该效果的配置值，后端所有未填权重仍统一为 `1.0`。

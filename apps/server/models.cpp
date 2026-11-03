@@ -168,12 +168,6 @@ bool Models::configure(const JVal & body, Selection & selected, int & status, st
             selected.extra_loras.push_back(std::move(adapter));
         }
     }
-    std::size_t count = !selected.path.empty() && selected.weight != 0 ? 1 : 0;
-    for (const auto & adapter : selected.extra_loras) if (adapter.weight != 0) ++count;
-    if (count > (std::size_t) m_capacity) {
-        error = "request uses more LoRAs than --lora-cache-size allows";
-        return false;
-    }
     status = 200;
     error.clear();
     return true;
@@ -183,7 +177,7 @@ std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int &
                                              const std::function<bool()> & cancelled) {
     status = 200;
     error.clear();
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
 
     const auto aborted = [&] {
         if (!cancelled || !cancelled()) return false;
@@ -197,25 +191,9 @@ std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int &
     if (!selected.path.empty() && selected.weight != 0) requested.emplace(selected.path, selected.weight);
     for (const auto & adapter : selected.extra_loras)
         if (adapter.weight != 0) requested.emplace(adapter.path, adapter.weight);
-    if (requested.size() > (std::size_t) m_capacity) {
-        status = 400;
-        error = "request uses more LoRAs than --lora-cache-size allows";
-        return {};
-    }
     if (requested.empty()) {
         ++m_base_users;
         return std::shared_ptr<Lease>(new Lease(*this, {}, "", true));
-    }
-    // Reserve the whole set together: two queued stacks must never each hold half their adapters.
-    const auto fits = [&] {
-        std::size_t busy_outside = 0;
-        for (const auto & item : m_cache)
-            if (item.second.users != 0 && !requested.count(item.first)) ++busy_outside;
-        return busy_outside + requested.size() <= (std::size_t) m_capacity;
-    };
-    while (!fits()) {
-        m_available.wait_for(lock, std::chrono::milliseconds(100));
-        if (aborted()) return {};
     }
     std::size_t missing = 0;
     for (const auto & item : requested) if (!m_cache.count(item.first)) ++missing;
@@ -225,6 +203,7 @@ std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int &
             if (it->second.users || requested.count(it->first)) continue;
             if (victim == m_cache.end() || it->second.last_used < victim->second.last_used) victim = it;
         }
+        if (victim == m_cache.end()) break;
         unload_locked(victim->first, victim->second);
         m_cache.erase(victim);
     }
@@ -239,13 +218,15 @@ std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int &
             bool loaded = false;
             m_sched.exec([&] { loaded = m_model.load_lora(slot, item.first); });
             if (!loaded) {
+                release_temporary_locked();
                 status = 422;
                 error = "failed to load LoRA adapter";
                 return {};
             }
-            found = m_cache.emplace(item.first, Entry{slot, 0, now}).first;
+            const bool temporary = m_cache.size() >= (std::size_t) m_capacity;
+            found = m_cache.emplace(item.first, Entry{slot, 0, now, temporary}).first;
             m_last_used[item.first] = now;
-            printf("LoRA cache loaded: %s\n", item.first.c_str());
+            printf("LoRA cache loaded%s: %s\n", temporary ? " (temporary)" : "", item.first.c_str());
             fflush(stdout);
         }
         paths.push_back(item.first);
@@ -272,7 +253,6 @@ std::shared_ptr<Models::Lease> Models::acquire(const Selection & selected, int &
     for (const auto & path : paths) ++m_cache.at(path).users;
     if (selected.register_id && !selected.id.empty() && m_cache.count(selected.path))
         m_registered[selected.id] = selected.path;
-    trim_stacks_locked();
     return std::shared_ptr<Lease>(new Lease(*this, std::move(paths), slot, false));
 }
 
@@ -297,10 +277,13 @@ std::string Models::default_id() const {
 std::string Models::json() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto now = std::chrono::steady_clock::now();
+    const auto temporary = std::count_if(m_cache.begin(), m_cache.end(),
+        [](const auto & item) { return item.second.temporary; });
     std::string out = "{\"object\":\"list\",\"active_model\":\"" + escape_json(m_default_id) +
                       "\",\"lora_cache\":{\"capacity\":" + std::to_string(m_capacity) +
                       ",\"idle_timeout_seconds\":" + std::to_string(m_idle_timeout_seconds) +
                       ",\"loaded\":" + std::to_string(m_cache.size()) +
+                      ",\"temporary_loaded\":" + std::to_string(temporary) +
                       ",\"weighted_compositions\":" + std::to_string(m_stacks.size()) + "},\"data\":[";
     bool first = true;
     for (const auto & item : m_registered) {
@@ -341,8 +324,17 @@ void Models::release(const std::vector<std::string> & paths, const std::string &
         item.second.cache.last_used = now;
         break;
     }
-    trim_stacks_locked();
-    m_available.notify_all();
+    release_unused_stacks_locked();
+    release_temporary_locked();
+}
+
+void Models::release_temporary_locked() {
+    for (auto it = m_cache.begin(); it != m_cache.end();) {
+        if (it->second.temporary && it->second.users == 0) {
+            unload_locked(it->first, it->second);
+            it = m_cache.erase(it);
+        } else ++it;
+    }
 }
 
 void Models::unload_locked(const std::string & path, const Entry & entry) {
@@ -357,16 +349,12 @@ void Models::unload_locked(const std::string & path, const Entry & entry) {
     fflush(stdout);
 }
 
-void Models::trim_stacks_locked() {
-    while (m_stacks.size() > (std::size_t) m_capacity) {
-        auto victim = m_stacks.end();
-        for (auto it = m_stacks.begin(); it != m_stacks.end(); ++it) {
-            if (it->second.cache.users != 0) continue;
-            if (victim == m_stacks.end() || it->second.cache.last_used < victim->second.cache.last_used) victim = it;
-        }
-        if (victim == m_stacks.end()) return;
-        m_sched.exec([&] { m_sched.unload_lora(victim->second.cache.slot); });
-        m_stacks.erase(victim);
+void Models::release_unused_stacks_locked() {
+    for (auto it = m_stacks.begin(); it != m_stacks.end();) {
+        if (it->second.cache.users != 0) { ++it; continue; }
+        // Each weight combination owns GPU generation buffers, not just a list of adapters.
+        m_sched.exec([&] { m_sched.unload_lora(it->second.cache.slot); });
+        it = m_stacks.erase(it);
     }
 }
 
