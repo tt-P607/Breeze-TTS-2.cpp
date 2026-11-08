@@ -33,28 +33,6 @@
 
 namespace breeze {
 
-static std::string mmss(double s) {
-    if (!(s >= 0) || s > 86399) s = 0;
-    char buf[16];
-    snprintf(buf, sizeof buf, "%02d:%02d", (int) s / 60, (int) s % 60);
-    return buf;
-}
-
-static std::string bar(double frac, int width) {
-    static const char * part[] = { " ", "\u258f", "\u258e", "\u258d", "\u258c", "\u258b", "\u258a", "\u2589" };
-    if (!(frac > 0)) frac = 0;
-    if (frac > 1) frac = 1;
-    const double filled = frac * width;
-    const int full = (int) filled;
-    std::string s;
-    for (int i = 0; i < full; i++) s += "\u2588";
-    if (full < width) {
-        s += part[(int) ((filled - full) * 8)];
-        for (int i = full + 1; i < width; i++) s += " ";
-    }
-    return s;
-}
-
 // an origin thats not on the allowlist gets an empty string, so no header goes out
 static std::string cors_origin(const std::string & allowed, const httplib::Request & req) {
     if (allowed == "*") return "*";
@@ -80,52 +58,32 @@ static void fail(httplib::Response & res, int status, const std::string & messag
     res.set_content(std::string("{\"error\":\"") + message + "\"}", "application/json");
 }
 
-// one generation with the console progress bar, emit gets each decoded chunk and false stops it
+// All transports use the same audio progress display.
 static bool run_generation(BreezeModel & model, MimiCodec & codec, GenScheduler & sched, const GenRequest & g, int sr,
-                           bool verbose, const AudioCallback & emit) {
+                           const RequestLog & request_log, bool verbose, const AudioCallback & emit) {
     GenTimings tm;
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto elapsed = [&] {
-        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    };
-    // the model decides when to stop, so the total is only ever an estimate
-    const double est = estimate_seconds(g.text);
-    size_t total = 0;
-    bool success = true;
+    SpeechProgress progress(request_log, g.text, sr);
+    bool alive = true;
     try {
-        generate(model, codec, g, [&](const float * s, int n) {
-            if (!emit(s, n)) return false;
-            total += (size_t) n;
-            const double secs = (double) total / sr, wall = elapsed();
-            const double rate = wall > 0 ? secs / wall : 0;
-            const double frac = est > 0 ? secs / est : 0;
-            const double eta = rate > 0 ? (est > secs ? (est - secs) / rate : 0) : 0;
-            // bars from several streams would just write over each other
-            if (sched.parallel() > 1) return true;
-            printf("\r%3.0f%%|%s| %.1f/%.1fs [%s<%s, %.1f fps, %.2fx]  ",
-                   (frac < 1 ? frac : 1) * 100, bar(frac, 24).c_str(), secs, est,
-                   mmss(wall).c_str(), mmss(eta).c_str(), secs * 12.5 / wall, rate);
-            fflush(stdout);
+        generate(model, codec, g, [&](const float * samples, int count) {
+            if (!emit(samples, count)) { alive = false; return false; }
+            progress.update((size_t) count);
             return true;
         }, &tm, &sched);
-    } catch (const std::exception & e) {
-        success = false;
-        fprintf(stderr, "\ngeneration error: %s\n", e.what());
+    } catch (const std::exception & error) {
+        progress.finish(false);
+        log_speech_event(request_log, std::string("生成失败：") + error.what());
+        return false;
     }
-    const double secs = (double) total / sr, wall = elapsed();
-    printf("\r%3.0f%%|%s| %.1f/%.1fs [%s, %.1f fps, %.2fx]        \n",
-           100.0, bar(1, 24).c_str(), secs, secs, mmss(wall).c_str(),
-           wall > 0 ? secs * 12.5 / wall : 0.0, wall > 0 ? secs / wall : 0.0);
-    printf("     %d frames in %d flushes, first audio %.0f ms\n",
-           tm.frames, tm.flushes, tm.first_audio);
+    const bool success = alive && !(g.cancelled && g.cancelled()) && tm.frames > 0;
+    progress.finish(success);
     if (verbose && tm.frames > 0) {
-        printf("     ref %.0f  prompt %.0f  prefill %.0f ms | per frame: backbone %.2f"
-               "  depth %.2f  vocoder %.2f ms\n",
-               tm.encode_ref, tm.prompt, tm.prefill, tm.backbone / tm.frames,
-               tm.depth / tm.frames, tm.vocoder / tm.frames);
+        printf("[合成 #%llu] %d frames, first audio %.0f ms, backbone %.2f / depth %.2f / vocoder %.2f ms\n",
+               (unsigned long long) request_log.id, tm.frames, tm.first_audio,
+               tm.backbone / tm.frames, tm.depth / tm.frames, tm.vocoder / tm.frames);
+        fflush(stdout);
     }
-    fflush(stdout);
-    return success && total > 0;
+    return success;
 }
 
 int run_server(const ServerOptions & opts) {
@@ -242,7 +200,7 @@ int run_server(const ServerOptions & opts) {
             }
             try {
                 ws_connection(c, model, codec, store, sched, models, execution_queue,
-                              opts.chunk_first, opts.chunk_max, opts.split_chars, opts.model);
+                              opts.chunk_first, opts.chunk_max, opts.split_chars);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(admission_mutex);
                 websocket_sessions.erase(&c);
@@ -355,7 +313,7 @@ int run_server(const ServerOptions & opts) {
             return;
         }
         const int cost = sched.cost(o.g.cfg_scale);
-        const auto request_log = log_speech_request("HTTP JSON", opts.model, selection, o.voice, o.g, o.parallel);
+        const auto request_log = log_speech_request("HTTP JSON", selection, o.g, o.parallel);
         auto permit = std::make_shared<RequestExecution>(execution_queue, o.parallel, cost, req.is_connection_closed,
             [&] { log_speech_event(request_log, "排队等待"); });
         if (!permit->acquired()) {
@@ -373,7 +331,6 @@ int run_server(const ServerOptions & opts) {
             return;
         }
         o.g.lora_id = lease->slot();
-        log_speech_event(request_log, "开始推理");
         o.g.chunk_first = opts.chunk_first;
         o.g.chunk_max = opts.chunk_max;
         std::string sent, ctype;
@@ -382,13 +339,6 @@ int run_server(const ServerOptions & opts) {
         res.set_header("X-Sample-Rate", std::to_string(enc->sample_rate(sr)));
         res.set_header("Cache-Control", "no-store");
         if (o.sse) ctype = "text/event-stream";
-
-        const char * mode = o.g.ref_frames > 0 ? (o.g.instruction != GenRequest().instruction ? "direction" : "clone")
-                                               : "design";
-        printf("gen  %s, %d chars, cfg %.1f, seed %d, openai %s%s%s\n", mode, (int) o.g.text.size(),
-               o.g.cfg_scale, o.g.seed, sent.c_str(), sent != o.format ? " for " : "",
-               sent != o.format ? o.format.c_str() : "");
-        fflush(stdout);
 
         res.set_chunked_content_provider(
             ctype, [&model, &codec, &sched, g = o.g, sse = o.sse, enc, lease, permit, request_log, sr, verbose = opts.verbose](
@@ -404,7 +354,7 @@ int run_server(const ServerOptions & opts) {
                 bool alive = flush();
                 bool generated = false;
                 if (alive) {
-                    generated = run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
+                    generated = run_generation(model, codec, sched, g, sr, request_log, verbose, [&](const float * s, int n) {
                         enc->write(s, n, buf);
                         return alive = flush();
                     });
@@ -416,8 +366,8 @@ int run_server(const ServerOptions & opts) {
                         }
                     }
                 }
-                log_speech_event(request_log, permit->cancelled() || !alive ? "已取消或连接断开" :
-                                 (generated ? "生成完成" : "生成失败"));
+                if (permit->cancelled() || !alive) log_speech_event(request_log, "已取消或连接断开");
+                else if (!generated) log_speech_event(request_log, "生成失败");
                 sink.done();
                 return true;
             });
@@ -452,8 +402,7 @@ int run_server(const ServerOptions & opts) {
         if (execution != "serial" && execution != "parallel")
             return fail(res, 400, "execution must be serial or parallel");
         const int cost = sched.cost(g.cfg_scale);
-        const auto request_log = log_speech_request("HTTP 表单", opts.model, selection,
-                                                   field(req, "voice_id", ""), g, execution == "parallel");
+        const auto request_log = log_speech_request("HTTP 表单", selection, g, execution == "parallel");
         auto permit = std::make_shared<RequestExecution>(execution_queue, execution == "parallel", cost, req.is_connection_closed,
             [&] { log_speech_event(request_log, "排队等待"); });
         if (!permit->acquired()) {
@@ -522,23 +471,16 @@ int run_server(const ServerOptions & opts) {
         res.set_header("X-Sample-Format", "s16le");
         res.set_header("Cache-Control", "no-store");
 
-        const bool sent_ins = req.has_file("instruction") || req.has_param("instruction");
-        const bool has_ref = !g.ref_audio.empty() || !g.ref_codes.empty();
-        const char * mode = has_ref ? (sent_ins ? "direction" : "clone") : "design";
-        printf("gen  %s, %d chars, cfg %.1f, seed %d\n", mode, (int) g.text.size(), g.cfg_scale, g.seed);
-        fflush(stdout);
-        log_speech_event(request_log, "开始推理");
-
         res.set_chunked_content_provider(
             "audio/pcm",
             [&model, &codec, &sched, g, lease, permit, request_log, sr, verbose = opts.verbose](size_t, httplib::DataSink & sink) {
                 bool alive = true;
-                const bool generated = run_generation(model, codec, sched, g, sr, verbose, [&](const float * s, int n) {
+                const bool generated = run_generation(model, codec, sched, g, sr, request_log, verbose, [&](const float * s, int n) {
                     const std::vector<uint8_t> pcm = to_pcm16(s, n);
                     return alive = !permit->cancelled() && sink.write((const char *) pcm.data(), pcm.size());
                 });
-                log_speech_event(request_log, permit->cancelled() || !alive ? "已取消或连接断开" :
-                                 (generated ? "生成完成" : "生成失败"));
+                if (permit->cancelled() || !alive) log_speech_event(request_log, "已取消或连接断开");
+                else if (!generated) log_speech_event(request_log, "生成失败");
                 sink.done();
                 return true;
             });
@@ -587,8 +529,7 @@ int run_server(const ServerOptions & opts) {
         log_parameters.instruction.clear();
         log_parameters.cfg_scale = (float) atof(field(req, "cfg_scale", "1.0").c_str());
         log_parameters.seed = atoi(field(req, "seed", "42").c_str());
-        const auto request_log = log_speech_request("HTTP 音色转换", opts.model, selection, vid,
-                                                   log_parameters, false);
+        const auto request_log = log_speech_request("HTTP 音色转换", selection, log_parameters, false);
         RequestExecution permit(execution_queue, false, sched.parallel(), req.is_connection_closed,
             [&] { log_speech_event(request_log, "排队等待"); });
         if (!permit.acquired()) {

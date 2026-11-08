@@ -116,8 +116,6 @@ struct Session {
     int cost = 1;
     bool parallel_execution = false;
     Models::Selection selection;
-    GenRequest log_parameters;
-    std::string voice_id;
     bool selection_registration_pending = false;
     bool started = false;
     bool ending = false;
@@ -134,14 +132,13 @@ static void event(WsConn & c, const std::string & type, const std::string & extr
 
 // drains the queue one piece at a time, taking a slot for each so other connections interleave
 static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & models,
-                    RequestQueue & execution_queue, const std::string & base_model) {
+                    RequestQueue & execution_queue) {
     for (;;) {
         Piece piece;
         Models::Selection selected;
         bool register_id = false;
         bool parallel_execution = false;
         GenRequest log_parameters;
-        std::string voice_id;
         {
             std::unique_lock<std::mutex> lock(s.mu);
             s.speaking = false;
@@ -160,13 +157,10 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
             selected = s.selection;
             register_id = s.selection_registration_pending;
             parallel_execution = s.parallel_execution;
-            log_parameters = s.log_parameters;
-            voice_id = s.voice_id;
         }
         log_parameters.text = piece.text;
         log_parameters.instruction = piece.instruction;
-        const auto request_log = log_speech_request("WebSocket", base_model, selected, voice_id,
-                                                   log_parameters, parallel_execution);
+        const auto request_log = log_speech_request("WebSocket", selected, log_parameters, parallel_execution);
         if (s.cancel) {
             log_speech_event(request_log, "已取消");
             s.cancel = false;
@@ -239,32 +233,37 @@ static void speaker(WsConn & conn, Session & s, GenScheduler & sched, Models & m
             s.gen.set_cancelled(permit.cancellation());
         }
         event(conn, "speaking", "\"text\":\"" + esc(piece.text) + "\"");
-        log_speech_event(request_log, "开始推理");
 
+        SpeechProgress progress(request_log, piece.text, 24000);
         bool ok = false;
         try {
             ok = s.gen.speak(piece.text, [&](const float * a, int n) {
                 if (s.cancel || !conn.alive()) return false;
                 std::vector<uint8_t> pcm = to_pcm16(a, n);
-                return conn.send_binary(pcm.data(), pcm.size());
+                const bool sent = conn.send_binary(pcm.data(), pcm.size());
+                if (sent) progress.update((size_t) n);
+                return sent;
             });
         } catch (const std::exception & e) {
+            progress.finish(false);
             log_speech_event(request_log, std::string("生成失败：") + e.what());
             fprintf(stderr, "websocket generation error: %s\n", e.what());
             event(conn, "error", "\"message\":\"generation failed\"");
             lease.reset();
             continue;
         } catch (...) {
+            progress.finish(false);
             log_speech_event(request_log, "生成失败：未知错误");
             fprintf(stderr, "websocket generation error: unknown exception\n");
             event(conn, "error", "\"message\":\"generation failed\"");
             lease.reset();
             continue;
         }
+        progress.finish(ok && !s.cancel && conn.alive());
         lease.reset();
         permit.release();
-        log_speech_event(request_log, s.cancel || !conn.alive() ? "已取消或连接断开" :
-                         (ok ? "本段完成" : "本段提前结束"));
+        if (s.cancel || !conn.alive()) log_speech_event(request_log, "已取消或连接断开");
+        else if (!ok) log_speech_event(request_log, "本段提前结束");
 
         if (s.cancel) { event(conn, "cancelled"); s.cancel = false; continue; }
         if (!ok && !conn.alive()) return;
@@ -346,9 +345,6 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
     s.cost = sched.cost(g.cfg_scale);
     s.parallel_execution = parallel_execution;
     s.selection = std::move(selection);
-    s.log_parameters.cfg_scale = g.cfg_scale;
-    s.log_parameters.seed = g.seed;
-    s.voice_id = vid;
     s.selection_registration_pending = s.selection.register_id;
     s.budget = (int) json_num(msg, "split_chars", split_chars);
     // streaming drains sentence by sentence, so it always needs a real budget to aim at
@@ -364,9 +360,9 @@ static void handle_start(WsConn & conn, Session & s, const JVal & msg, BreezeMod
 void ws_connection(WsConn & conn, BreezeModel & model, MimiCodec & codec, VoiceStore & store,
                    GenScheduler & sched, Models & models,
                    RequestQueue & execution_queue,
-                   int chunk_first, int chunk_max, int split_chars, const std::string & base_model) {
+                   int chunk_first, int chunk_max, int split_chars) {
     Session s;
-    std::thread worker([&] { speaker(conn, s, sched, models, execution_queue, base_model); });
+    std::thread worker([&] { speaker(conn, s, sched, models, execution_queue); });
     event(conn, "ready", "\"sample_rate\":24000,\"format\":\"s16le\"");
 
     std::string raw;

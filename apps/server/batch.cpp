@@ -124,8 +124,7 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
                 Item & item = items[index];
                 if (!item.error.empty()) continue;
                 const auto item_started = Clock::now();
-                const auto request_log = log_speech_request("HTTP batch/" + item.id, options.model,
-                    item.selection, item.speech.voice, item.speech.g, parallel);
+                const auto request_log = log_speech_request("HTTP batch/" + item.id, item.selection, item.speech.g, parallel);
                 try {
                     RequestExecution permit(execution_queue, parallel, scheduler.cost(item.speech.g.cfg_scale),
                                              request.is_connection_closed,
@@ -143,16 +142,17 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
                         continue;
                     }
                     item.speech.g.lora_id = lease->slot();
-                    log_speech_event(request_log, "开始推理");
                     std::string sent, content_type;
                     auto encoder = make_encoder("wav", model.cfg.sample_rate, sent, content_type);
                     encoder->begin(item.audio);
                     GenTimings timings;
+                    SpeechProgress progress(request_log, item.speech.g.text, model.cfg.sample_rate);
                     generate(model, codec, item.speech.g, [&](const float * samples, int count) {
                         if (permit.cancelled()) return false;
                         if (!item.samples) item.first_audio_ms = elapsed_ms(item_started);
                         encoder->write(samples, count, item.audio);
                         item.samples += (size_t) count;
+                        progress.update((size_t) count);
                         return true;
                     }, &timings, &scheduler);
                     encoder->finish(item.audio);
@@ -165,7 +165,8 @@ void add_batch_route(httplib::Server & server, BreezeModel & model, MimiCodec & 
                         item.error = "generation returned no audio";
                         item.audio.clear();
                     } else finish_wav(item.audio);
-                    log_speech_event(request_log, item.error.empty() ? "生成完成" : item.error);
+                    progress.finish(item.error.empty());
+                    if (!item.error.empty()) log_speech_event(request_log, item.error);
                 } catch (const std::exception & error) {
                     log_speech_event(request_log, std::string("生成失败：") + error.what());
                     item.status = 500;

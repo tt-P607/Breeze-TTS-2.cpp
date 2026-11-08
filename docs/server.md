@@ -632,11 +632,14 @@ changes.
 
 ## Request logs
 
-Speech requests print a numbered block to stdout with the full text, instruction,
-base GGUF path, selected model ID, nonzero LoRA paths and weights, reference
-voice ID, execution mode, CFG and seed. Queue, inference and terminal events
-reuse that number and include elapsed time. WebSocket text is logged per spoken
-piece with the instruction captured for that piece; batch items have separate
-numbers. These logs are always enabled and flushed immediately, so they also
-appear when the server is hosted by a process manager. Control characters are
-escaped; Chinese text is kept readable.
+Speech requests print a numbered block with the selected model ID and active
+LoRA filenames and weights. Instructions and spoken text have separate headings;
+long lines wrap without splitting UTF-8 characters. The base path is printed at
+startup, rather than repeated for each request.
+
+HTTP, WebSocket and batch speech show a live audio progress bar with generated
+audio duration, elapsed time and generation speed. The percentage is estimated
+until generation ends; only a successful completion reaches 100%. WebSocket
+pieces use their captured instructions and separate request numbers. Updates
+flush immediately for both a console and a process manager; request blocks and
+progress lines share an output lock to keep concurrent requests readable.

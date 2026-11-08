@@ -106,14 +106,17 @@ def main():
             assert all(row["status"] == "ok" and len(base64.b64decode(row["audio_base64"])) > 44
                        for row in response.json()["results"])
             text = log_path.read_text(encoding="utf-8")
-            headers = re.findall(r"【合成请求 #(\d+)】", text)
+            headers = re.findall(r"############ 合成 #(\d+) \|", text)
             assert len(headers) == 6 and len(set(headers)) == 6, headers
             for expected in ["HTTP JSON", "HTTP 表单", "WebSocket", "HTTP batch/first", "HTTP batch/second",
-                             "你好。\\n晚安。", "温柔地说，句间稍停。", "明快亲切。", "平静缓慢。",
-                             "weight=0.8", "weight=0.5", "开始推理", "生成完成", "本段完成"]:
+                             "你好。", "晚安。", "温柔地说，句间稍停。", "明快亲切。", "平静缓慢。",
+                             "weight=0.8", "weight=0.5", "############ 语气指令 ############",
+                             "############ 推理文本 ############", "0% 预计", "100% 完成", "速度"]:
                 assert expected in text, f"missing log field: {expected}"
-            quoted_base = json.dumps(str(args.model), ensure_ascii=False)[1:-1]
-            assert quoted_base in text
+            assert "底模路径：" not in text and "voice_id：" not in text
+            assert text.count("100% 完成") == 6
+            for identifier in headers:
+                assert re.search(rf"\[合成 #{identifier}\] \[[#-]+\]", text)
             assert args.lora.name in text and args.extra_lora.name in text
             result = {"passed": True, "real_audio_requests": 6, "unique_request_ids": headers,
                       "coverage": ["HTTP JSON weighted stack", "HTTP form", "WS instruction changes",

@@ -1,9 +1,9 @@
 #include "request_log.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
@@ -69,103 +69,140 @@ private:
 
 static void formatting() {
     Models::Selection selected;
-    selected.id = "爱莉-日常";
-    selected.path = "角色模型/爱莉/主音色.gguf";
+    selected.id = "elysia";
+    selected.path = "E:/private/models/voice/main.voice.gguf";
     selected.weight = 0.8f;
-    selected.extra_loras.push_back({"风格模型/ASMR/耳语.gguf", 0.35f});
-    selected.extra_loras.push_back({"风格模型/停用.gguf", 0.0f});
+    selected.extra_loras.push_back({"E:/private/styles/ASMR/whisper.gguf", 0.35f});
+    selected.extra_loras.push_back({"E:/private/styles/inactive.gguf", 0.0f});
 
     GenRequest request;
-    request.text = "第一行\n第二行\t保留中文";
-    request.instruction = "轻声\r缓慢\x01";
-    request.cfg_scale = 1.25f;
-    request.seed = 73;
+    request.instruction = "轻声\r缓慢\t\x1B";
+    request.text = std::string(78, 'x') + "中\r\n\n第二行\t尾\x1B";
 
-    const std::string block = format_speech_request(
-        99, "HTTP\n请求", "runtime/底模.gguf", selected, "voice\r1", request, true);
-    require(block.find("【合成请求 #99】") != std::string::npos, "request ID missing");
-    require(block.find("请求中的 LoRA（非零权重）") != std::string::npos,
-            "requested adapter status was not labeled accurately");
-    require(block.find("来源：\"HTTP\\n请求\"") != std::string::npos, "source newline was not escaped");
-    require(block.find("底模路径：\"runtime/底模.gguf\"") != std::string::npos,
-            "Chinese model path was not preserved");
-    require(block.find("主音色.gguf\"") != std::string::npos, "primary LoRA missing");
-    require(block.find("ASMR/耳语.gguf\"") != std::string::npos, "ASMR LoRA missing");
-    require(block.find("停用.gguf") == std::string::npos, "zero-weight LoRA was logged as enabled");
-    require(block.find("weight=0.8") != std::string::npos && block.find("weight=0.35") != std::string::npos,
-            "active LoRA weights missing");
-    require(block.find("voice_id：\"voice\\r1\"") != std::string::npos, "voice ID was not escaped");
-    require(block.find("指令：\"轻声\\r缓慢\\x01\"") != std::string::npos,
-            "instruction controls were not escaped");
-    require(block.find("文本：\"第一行\\n第二行\\t保留中文\"") != std::string::npos,
-            "multiline Chinese text was not preserved and escaped");
-    require(block.find("cfg：1.25") != std::string::npos && block.find("seed：73") != std::string::npos,
-            "cfg or seed missing");
-    require(block.find("\\u") == std::string::npos, "Unicode text was converted to codepoint escapes");
+    const std::string block = format_speech_request(99, "HTTP batch/7\nline", selected, request, true);
+    require(block.find("############ 合成 #99 | 来源：HTTP batch/7\\nline | 并行 ############") !=
+                std::string::npos,
+            "request header or source escaping missing");
+    require(block.find("模型ID：elysia\n") != std::string::npos, "model ID missing");
+    require(block.find("主 LoRA：main.voice.gguf（weight=0.8）") != std::string::npos,
+            "primary LoRA filename or weight missing");
+    require(block.find("附加 LoRA：whisper.gguf（weight=0.35）") != std::string::npos,
+            "extra LoRA filename or weight missing");
+    require(block.find("inactive.gguf") == std::string::npos, "zero-weight LoRA was printed");
+    require(block.find("E:/private") == std::string::npos, "full LoRA paths were printed");
+    require(block.find("voice_id") == std::string::npos && block.find("cfg") == std::string::npos &&
+            block.find("seed") == std::string::npos && block.find("底模") == std::string::npos,
+            "private or low-value request fields were printed");
+    require(block.find('"') == std::string::npos, "request fields were wrapped in quotes");
+    require(block.find("############ 语气指令 ############\n  轻声\n  缓慢\\t\\x1B\n\n") !=
+                std::string::npos,
+            "instruction section or control escaping failed");
+    const std::string wrapped = "############ 推理文本 ############\n  " + std::string(78, 'x') +
+                                "\n  中\n  \n  第二行\\t尾\\x1B\n";
+    require(block.find(wrapped) != std::string::npos,
+            "Chinese text wrap split a code point or changed an original line break");
 
-    const auto elapsed = std::chrono::milliseconds(12);
-    const std::string event = format_speech_event(99, "完成", elapsed);
-    require(event.find("【合成请求 #99 事件】") != std::string::npos &&
-            event.find("事件：\"完成\"，已用时：12.000 ms") != std::string::npos,
-            "event ID or elapsed time missing");
+    const std::string event = format_speech_event(99, "开始推理", std::chrono::milliseconds(1200));
+    require(event == "[合成 #99] 开始推理 | 1.20s\n", "event was not a single readable line");
 }
 
-static void concurrent_logging() {
-    constexpr int threads = 8;
-    constexpr int per_thread = 16;
+static std::vector<uint64_t> ids_in_progress_lines(const std::string & output) {
+    std::vector<uint64_t> ids;
+    size_t line = 0;
+    while (line < output.size()) {
+        const size_t end = output.find('\n', line);
+        const std::string row = output.substr(line, end == std::string::npos ? end : end - line);
+        size_t pos = 0;
+        std::set<uint64_t> row_ids;
+        while ((pos = row.find("[合成 #", pos)) != std::string::npos) {
+            const size_t id_start = pos + std::strlen("[合成 #");
+            const size_t id_end = row.find_first_not_of("0123456789", id_start);
+            require(id_end != std::string::npos, "progress ID was malformed");
+            row_ids.insert(std::strtoull(row.substr(id_start, id_end - id_start).c_str(), nullptr, 10));
+            pos = id_end;
+        }
+        require(row_ids.size() <= 1, "different progress IDs shared one output line");
+        if (!row_ids.empty()) ids.push_back(*row_ids.begin());
+        if (end == std::string::npos) break;
+        line = end + 1;
+    }
+    return ids;
+}
+
+static void progress_output() {
     StdoutCapture capture;
-    std::vector<RequestLog> logs(threads * per_thread);
+
+    Models::Selection selected;
+    selected.id = "request-model";
+    GenRequest request;
+    request.instruction = "轻声";
+    request.text = "正文不得被进度覆盖";
+    const RequestLog first = log_speech_request("HTTP", selected, request, false);
+    {
+        SpeechProgress progress(first, "abcdefghij", 1000);
+        progress.update(250);
+        log_speech_event(first, "开始推理");
+        progress.finish(true);
+        progress.finish(false);
+    }
+
+    const RequestLog failed{600, std::chrono::steady_clock::now()};
+    {
+        SpeechProgress progress(failed, "abcdefghij", 1000);
+        progress.update(100);
+        progress.finish(false);
+    }
+
+    constexpr int tasks = 4;
+    std::vector<RequestLog> logs;
+    std::vector<std::unique_ptr<SpeechProgress>> progress;
+    for (int i = 0; i < tasks; ++i) {
+        Models::Selection concurrent_selection;
+        concurrent_selection.id = "concurrent-" + std::to_string(i);
+        GenRequest concurrent_request;
+        concurrent_request.text = "并发正文-" + std::to_string(i);
+        concurrent_request.instruction = "并发指令";
+        logs.push_back(log_speech_request("HTTP batch/" + std::to_string(i), concurrent_selection,
+                                          concurrent_request, true));
+    }
+    for (const auto & log : logs)
+        progress.emplace_back(new SpeechProgress(log, "abcdefghij", 1000));
+
     std::vector<std::thread> workers;
-    for (int t = 0; t < threads; ++t) {
-        workers.emplace_back([&, t] {
-            for (int i = 0; i < per_thread; ++i) {
-                const int index = t * per_thread + i;
-                Models::Selection selected;
-                selected.id = "model-" + std::to_string(index);
-                GenRequest request;
-                request.text = "request-" + std::to_string(index) + "\n中文";
-                request.instruction = "instruction-" + std::to_string(index);
-                logs[index] = log_speech_request("批量编号-" + std::to_string(index),
-                                                 "base.gguf", selected, "voice", request, index % 2 == 0);
-            }
+    for (int i = 0; i < tasks; ++i) {
+        workers.emplace_back([&, i] {
+            progress[i]->update(static_cast<size_t>(i + 1) * 100);
+            progress[i]->finish(true);
         });
     }
     for (auto & worker : workers) worker.join();
 
-    std::set<uint64_t> ids;
-    for (const auto & log : logs) ids.insert(log.id);
-    require(ids.size() == logs.size(), "concurrent request IDs collided");
-
     const std::string output = capture.contents();
-    size_t block_count = 0;
-    size_t begin = 0;
-    while ((begin = output.find("【合成请求 #", begin)) != std::string::npos) {
-        const size_t end = output.find("【合成请求 #", begin + 1);
-        const std::string block = output.substr(begin, end == std::string::npos ? end : end - begin);
-        const size_t id_start = begin + std::strlen("【合成请求 #");
-        const size_t id_end = output.find_first_not_of("0123456789", id_start);
-        require(id_end != std::string::npos, "request block ID is malformed");
-        const uint64_t id = std::strtoull(output.substr(id_start, id_end - id_start).c_str(), nullptr, 10);
-        require(ids.count(id) == 1, "output contained an unknown request ID");
-        const auto matching = std::find_if(logs.begin(), logs.end(), [id](const RequestLog & log) {
-            return log.id == id;
-        });
-        require(matching != logs.end(), "request ID was not returned");
-        const size_t index = static_cast<size_t>(matching - logs.begin());
-        require(block.find("模型ID：\"model-" + std::to_string(index) + "\"") != std::string::npos &&
-                block.find("文本：\"request-" + std::to_string(index) + "\\n中文\"") !=
-                    std::string::npos &&
-                block.find("指令：\"instruction-" + std::to_string(index) + "\"") !=
-                    std::string::npos,
-                "concurrent request log block was interleaved");
-        ++block_count;
-        begin = end == std::string::npos ? output.size() : end;
+    require(output.find("推理文本 ############\n  正文不得被进度覆盖") != std::string::npos,
+            "progress output overwrote the request body");
+    require(output.find("0% 预计") != std::string::npos, "constructor did not draw initial zero progress");
+    require(output.find("42% 预计") != std::string::npos, "first chunk did not update expected progress");
+    require(output.find("音频 0.25s") != std::string::npos && output.find("速度 ") != std::string::npos,
+            "sample count or progress timing fields missing");
+    require(output.find("100% 完成") != std::string::npos, "successful finish did not draw 100 percent");
+    require(output.find("17% 中断") != std::string::npos, "failed progress did not preserve its incomplete percent");
+    require(output.find("[合成 #600]") != std::string::npos &&
+            output.find("[合成 #600] [####---------------------]  17% 中断") != std::string::npos,
+            "failed final progress line missing");
+    require(ids_in_progress_lines(output).size() >= static_cast<size_t>(tasks + 3),
+            "concurrent progress snapshots were lost");
+    for (int i = 0; i < tasks; ++i) {
+        require(output.find("并发正文-" + std::to_string(i)) != std::string::npos,
+                "concurrent request body was missing");
+        const std::string marker = "############ 合成 #" + std::to_string(logs[i].id);
+        const std::string progress_id = "[合成 #" + std::to_string(logs[i].id) + "]";
+        require(output.find(marker) != std::string::npos && output.find(progress_id) != std::string::npos,
+                "concurrent request did not retain its own progress ID");
     }
-    require(block_count == logs.size(), "a concurrent log block was lost or split");
 }
 
 int main() {
     formatting();
-    concurrent_logging();
-    std::puts("request log: formatting, escaping, IDs and concurrent blocks passed");
+    progress_output();
+    std::puts("request log: GSV-style sections, UTF-8 wrapping, progress and concurrency passed");
 }
