@@ -1,6 +1,9 @@
 #include "breeze/gguf_loader.h"
 
 #include <cstdio>
+#include <cstring>
+#include <utility>
+#include <vector>
 #include <stdexcept>
 
 namespace breeze {
@@ -11,13 +14,38 @@ namespace breeze {
 #define breeze_fseek fseeko
 #endif
 
-bool GGUFModel::load(const std::string & path, Backend & be) {
+bool GGUFModel::load(const std::string & path, Backend & be, Backend * cpu_be, const char * cpu_prefix) {
     free();
     gguf_init_params gp{ /*no_alloc=*/true, /*ctx=*/&meta };
     gguf = gguf_init_from_file(path.c_str(), gp);
     if (!gguf) {
         free();
         return false;
+    }
+
+    // pointing the originals at cpu twins makes the gpu alloc below skip them, it only takes tensors with no data
+    if (cpu_be && cpu_be->backend && cpu_prefix) {
+        const size_t plen = strlen(cpu_prefix);
+        const int64_t nt = gguf_get_n_tensors(gguf);
+        ggml_init_params cp{ ggml_tensor_overhead() * (size_t) (nt + 1), nullptr, true };
+        meta_cpu = ggml_init(cp);
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> twins;
+        for (int64_t i = 0; i < nt; i++) {
+            const char * name = gguf_get_tensor_name(gguf, i);
+            if (strncmp(name, cpu_prefix, plen) != 0) continue;
+            ggml_tensor * t = ggml_get_tensor(meta, name);
+            ggml_tensor * d = ggml_dup_tensor(meta_cpu, t);
+            ggml_set_name(d, name);
+            twins.emplace_back(t, d);
+        }
+        if (!twins.empty()) {
+            buffer_cpu = ggml_backend_alloc_ctx_tensors(meta_cpu, cpu_be->backend);
+            if (!buffer_cpu) {
+                free();
+                return false;
+            }
+            for (auto & [t, d] : twins) { t->data = d->data; t->buffer = d->buffer; }
+        }
     }
 
     buffer = ggml_backend_alloc_ctx_tensors(meta, be.backend);
@@ -60,6 +88,10 @@ bool GGUFModel::load(const std::string & path, Backend & be) {
 
 void GGUFModel::free() {
     if (buffer) ggml_backend_buffer_free(buffer);
+    if (buffer_cpu) ggml_backend_buffer_free(buffer_cpu);
+    if (meta_cpu) ggml_free(meta_cpu);
+    buffer_cpu = nullptr;
+    meta_cpu = nullptr;
     if (meta) ggml_free(meta);
     if (gguf) gguf_free(gguf);
     tensors.clear();

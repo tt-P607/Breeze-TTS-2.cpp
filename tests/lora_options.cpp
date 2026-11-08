@@ -231,6 +231,7 @@ static void test_options() {
 
 static void test_cache_lifecycle() {
     require(ServerOptions{}.lora_cache_size == 3, "server default LoRA cache capacity is not three");
+    require(!ServerOptions{}.te_cpu, "CPU text encoding must remain opt-in");
 
     TempDir temp;
     std::map<std::string, std::string> adapters;

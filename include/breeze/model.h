@@ -31,6 +31,9 @@ struct ActiveLora {
 
 struct BreezeModel {
     Backend backend;
+    // only used for the text encoder with te_cpu
+    Backend cpu;
+    bool te_cpu = false;
     GGUFModel gg;
     BreezeConfig cfg;
     Tokenizer tok;
@@ -38,7 +41,8 @@ struct BreezeModel {
     std::map<std::string, std::vector<LoraWeight>> lora_stacks;
     std::vector<ActiveLora> active_loras;
 
-    bool load(const std::string & path, bool prefer_gpu);
+    // BREEZE_TE_CPU=1 opts into CPU text encoding for the C API and bindings too.
+    bool load(const std::string & path, bool prefer_gpu, bool te_cpu = false);
     bool load_lora(const std::string & id, const std::string & path);
     bool set_lora(const std::string & id);
     void add_lora_stack(const std::string & id, const std::vector<LoraWeight> & weights);

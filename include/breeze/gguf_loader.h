@@ -17,7 +17,10 @@ struct GGUFModel {
     ggml_backend_buffer_t buffer = nullptr;
     std::unordered_map<std::string, ggml_tensor *> tensors;
 
-    bool load(const std::string & path, Backend & be);
+    // tensors starting with cpu_prefix live on cpu_be instead
+    bool load(const std::string & path, Backend & be, Backend * cpu_be = nullptr, const char * cpu_prefix = nullptr);
+    ggml_context * meta_cpu = nullptr;
+    ggml_backend_buffer_t buffer_cpu = nullptr;
     void free();
 
     ggml_tensor * get(const std::string & name) const;
