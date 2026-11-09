@@ -2,8 +2,11 @@
 #include "breeze/backbone.h"
 #include "breeze/scheduler.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -119,6 +122,228 @@ static void test_graph(Backend & be) {
     try { g.prepare(be, out); }
     catch (const std::logic_error &) { rejected = true; }
     require(rejected, "preparing the same graph twice was accepted");
+}
+
+static void test_scale_add_fusion(Backend & be) {
+    struct Case { int rank, out, rows; float scale; bool reverse_add, edge; };
+    const Case cases[] = {{16, 128, 1, 2.0f, false, false}, {32, 1536, 1, 1.6f, true, false},
+                          {1536, 128, 1, 1.6f, false, false},
+                          {64, 1536, 2, 3.6f, false, false}, {16, 128, 1, 1.6f, false, true}};
+    for (const auto & c : cases) {
+        ggml_init_params params{ggml_tensor_overhead() * 2, nullptr, true};
+        auto * ctx = ggml_init(params);
+        require(ctx != nullptr, "F16 test context allocation failed");
+        auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, c.rank, c.out);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, be.backend);
+        require(buffer != nullptr, "F16 test buffer allocation failed");
+        std::vector<ggml_fp16_t> weights(c.rank * c.out);
+        if (c.edge) {
+            // Basis columns carry signed-zero and tiny inputs through the matvec.
+            for (int i = 0; i < c.rank; i++) weights[i * c.rank + i] = ggml_fp32_to_fp16(1.0f);
+        } else {
+            for (size_t i = 0; i < weights.size(); i++)
+                weights[i] = ggml_fp32_to_fp16((static_cast<int>(i % 61) - 30) * 0.0003f);
+        }
+        ggml_backend_tensor_set(w, weights.data(), 0, ggml_nbytes(w));
+        std::vector<float> input(c.rank * c.rows), bias(c.out);
+        for (size_t i = 0; i < input.size(); i++) input[i] = (static_cast<int>((i * 7) % 37) - 18) * 0.015625f;
+        input[0] = 0.0f; input[1] = -0.0f; input[2] = 1e-30f; input[3] = -1e-30f;
+        for (size_t i = 0; i < bias.size(); i++) bias[i] = (static_cast<int>(i % 29) - 14) * 0.0078125f;
+        if (c.edge) {
+            std::fill(input.begin(), input.end(), 0.0f);
+            input[1] = -0.0f; input[2] = 1e-30f; input[3] = -1e-30f;
+            std::fill(bias.begin(), bias.end(), 0.0f);
+        }
+
+        std::vector<float> product;
+        {
+            Graph g(32);
+            auto * x = g.input_f32(input, c.rank, c.rows);
+            auto * mm = ggml_mul_mat(g.ctx, w, x);
+            g.compute(be, mm);
+            product = tensor_to_f32(mm);
+        }
+        std::vector<float> scaled;
+        {
+            Graph g(16);
+            auto * x = g.input_f32(product, c.out, c.rows);
+            auto * y = ggml_scale(g.ctx, x, c.scale);
+            g.compute(be, y);
+            scaled = tensor_to_f32(y);
+        }
+        std::vector<float> expected;
+        {
+            Graph g(16);
+            auto * x = g.input_f32(scaled, c.out, c.rows);
+            auto * b = g.input_f32(bias, c.out);
+            auto * y = c.reverse_add ? ggml_add(g.ctx, b, x) : ggml_add(g.ctx, x, b);
+            g.compute(be, y);
+            expected = tensor_to_f32(y);
+        }
+        std::vector<float> actual;
+        {
+            Graph g(32);
+            auto * x = g.input_f32(input, c.rank, c.rows);
+            auto * b = g.input_f32(bias, c.out);
+            auto * mm = ggml_mul_mat(g.ctx, w, x);
+            auto * y = ggml_scale(g.ctx, mm, c.scale);
+            auto * out = c.reverse_add ? ggml_add(g.ctx, b, y) : ggml_add(g.ctx, y, b);
+            g.compute(be, out);
+            actual = tensor_to_f32(out);
+        }
+        require(expected.size() == actual.size() &&
+                std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(float)) == 0,
+                "F16 matvec-scale-add changed exact F32 results");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+}
+
+static LoraAdapter * add_qkv_test_adapter(BreezeModel & m, const std::string & prefix,
+                                          const std::string & id, float scale, int seed, bool partial = false,
+                                          int rank = 16) {
+    auto adapter = std::make_unique<LoraAdapter>();
+    adapter->scale = scale;
+    ggml_init_params params{ggml_tensor_overhead() * (partial ? 2 : 6) + 4096, nullptr, true};
+    adapter->gg.meta = ggml_init(params);
+    require(adapter->gg.meta != nullptr, "QKV LoRA test context allocation failed");
+    const std::array<std::string, 3> names = {prefix + ".attn_q.weight", prefix + ".attn_k.weight",
+                                               prefix + ".attn_v.weight"};
+    for (size_t i = 0; i < names.size(); i++) {
+        if (partial && i != 0) continue;
+        auto * base = m.w(names[i]);
+        require(base != nullptr, "QKV LoRA test base weight is missing");
+        auto * a = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F16, base->ne[0], rank);
+        auto * b = ggml_new_tensor_2d(adapter->gg.meta, GGML_TYPE_F16, rank, base->ne[1]);
+        adapter->gg.tensors.emplace(names[i] + ".lora_a", a);
+        adapter->gg.tensors.emplace(names[i] + ".lora_b", b);
+    }
+    adapter->gg.buffer = ggml_backend_alloc_ctx_tensors(adapter->gg.meta, m.backend.backend);
+    require(adapter->gg.buffer != nullptr, "QKV LoRA test buffer allocation failed");
+    for (size_t i = 0; i < names.size(); i++) {
+        auto * a = adapter->gg.find(names[i] + ".lora_a");
+        auto * b = adapter->gg.find(names[i] + ".lora_b");
+        if (!a) continue;
+        std::vector<ggml_fp16_t> av(ggml_nelements(a)), bv(ggml_nelements(b));
+        for (size_t j = 0; j < av.size(); j++)
+            av[j] = ggml_fp32_to_fp16((static_cast<int>((j * 7 + seed + i * 3) % 17) - 8) * 0.00390625f);
+        for (size_t j = 0; j < bv.size(); j++)
+            bv[j] = ggml_fp32_to_fp16((static_cast<int>((j * 11 + seed * 3 + i * 7) % 19) - 9) * 0.0078125f);
+        ggml_backend_tensor_set(a, av.data(), 0, ggml_nbytes(a));
+        ggml_backend_tensor_set(b, bv.data(), 0, ggml_nbytes(b));
+    }
+    auto [it, inserted] = m.loras.emplace(id, std::move(adapter));
+    require(inserted, "QKV LoRA test adapter ID already exists");
+    return it->second.get();
+}
+
+static void test_qkv_projection_cases(BreezeModel & m, const std::string & prefix) {
+    const std::array<std::string, 3> names = {prefix + ".attn_q.weight", prefix + ".attn_k.weight",
+                                               prefix + ".attn_v.weight"};
+    auto * q_weight = m.w(names[0]);
+    require(q_weight != nullptr && q_weight->type == GGML_TYPE_Q8_0, "QKV test needs a Q8 base model");
+    const int k = (int)q_weight->ne[0];
+    std::vector<float> input(k);
+    for (size_t i = 0; i < input.size(); i++) input[i] = (static_cast<int>((i * 29) % 127) - 63) * 0.0078125f;
+
+    const auto saved_active = m.active_loras;
+    const bool saved_fuse_qkv = m.fuse_qkv;
+    const std::string partial_id = "qkv-test-partial";
+    auto * partial = add_qkv_test_adapter(m, prefix, partial_id, 2.0f, 19, true);
+    m.fuse_qkv = true;
+
+    const auto same_bits = [](const std::vector<float> & a, const std::vector<float> & b) {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+    };
+    const auto compare = [&](const std::string & scenario, const std::vector<ActiveLora> & active) {
+        m.active_loras = active;
+        std::array<std::vector<float>, 3> expected;
+        for (size_t i = 0; i < names.size(); i++) {
+            Graph ref(64);
+            auto * x = ref.input_f32(input, k);
+            auto * y = m.project(ref.ctx, names[i], x);
+            ref.compute(m.backend, y);
+            expected[i] = tensor_to_f32(y);
+        }
+        std::array<std::vector<float>, 3> actual;
+        {
+            Graph g(64);
+            auto * x = g.input_f32(input, k);
+            std::array<ggml_tensor *, 3> out{};
+            require(m.project_qkv(g.ctx, prefix, x, out), "QKV packing rejected " + scenario);
+            ggml_set_output(out[0]); g.write(out[0]);
+            ggml_set_output(out[1]); g.write(out[1]);
+            g.compute(m.backend, out[2]);
+            for (size_t i = 0; i < out.size(); i++) actual[i] = tensor_to_f32(out[i]);
+        }
+        for (size_t i = 0; i < expected.size(); i++)
+            require(same_bits(expected[i], actual[i]), "QKV output changed for " + scenario);
+    };
+    compare("no LoRA", {});
+    const int supported_ranks[] = {4, 8, 16, 32, 64, 128, 256};
+    for (int rank : supported_ranks) {
+        const std::string role_id = "qkv-test-role-" + std::to_string(rank);
+        const std::string style_id = "qkv-test-style-" + std::to_string(rank);
+        auto * role = add_qkv_test_adapter(m, prefix, role_id, 2.0f, 3 + rank, false, rank);
+        auto * style = add_qkv_test_adapter(m, prefix, style_id, 1.6f, 11 + rank, false, rank);
+        compare("rank " + std::to_string(rank) + " role 1", {{role, 1.0f}});
+        compare("rank " + std::to_string(rank) + " role 0.9", {{role, 0.9f}});
+        compare("rank " + std::to_string(rank) + " role 0.9 + style 1.8",
+                {{role, 0.9f}, {style, 1.8f}});
+        m.active_loras.clear();
+        m.loras.erase(style_id);
+        m.loras.erase(role_id);
+    }
+
+    {
+        Graph g(64);
+        std::vector<float> input2((size_t)k * 2, 0.125f);
+        auto * x = g.input_f32(input2, k, 2);
+        std::array<ggml_tensor *, 3> out{};
+        require(!m.project_qkv(g.ctx, prefix, x, out), "multi-column QKV input was accepted");
+    }
+    m.active_loras = {{partial, 1.0f}};
+    {
+        Graph g(64);
+        auto * x = g.input_f32(input, k);
+        std::array<ggml_tensor *, 3> out{};
+        require(!m.project_qkv(g.ctx, prefix, x, out), "partial Q-only LoRA was silently ignored");
+    }
+    m.active_loras = saved_active;
+    m.fuse_qkv = saved_fuse_qkv;
+    m.loras.erase(partial_id);
+}
+
+static void test_qkv_projection_large() {
+    BreezeModel large;
+    large.backend.init(true);
+    require(large.backend.is_gpu, "large QKV test needs a GPU backend");
+    ggml_init_params params{ggml_tensor_overhead() * 3 + 4096, nullptr, true};
+    large.gg.meta = ggml_init(params);
+    require(large.gg.meta != nullptr, "large QKV test context allocation failed");
+    const std::string prefix = "bb.blk.0";
+    struct Spec { const char * suffix; int rows; };
+    const Spec specs[] = {{".attn_q.weight", 1536}, {".attn_k.weight", 256}, {".attn_v.weight", 256}};
+    std::vector<ggml_tensor *> weights;
+    for (const auto & spec : specs) {
+        const std::string name = prefix + spec.suffix;
+        auto * t = ggml_new_tensor_2d(large.gg.meta, GGML_TYPE_Q8_0, 1536, spec.rows);
+        ggml_set_name(t, name.c_str());
+        large.gg.tensors.emplace(name, t);
+        weights.push_back(t);
+    }
+    large.gg.buffer = ggml_backend_alloc_ctx_tensors(large.gg.meta, large.backend.backend);
+    require(large.gg.buffer != nullptr, "large QKV test buffer allocation failed");
+    for (size_t i = 0; i < weights.size(); i++) {
+        auto * t = weights[i];
+        std::vector<float> src(ggml_nelements(t));
+        for (size_t j = 0; j < src.size(); j++) src[j] = (static_cast<int>((j * 13 + i * 5) % 43) - 21) * 0.0002f;
+        std::vector<uint8_t> packed(ggml_nbytes(t));
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, src.data(), packed.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+        ggml_backend_tensor_set(t, packed.data(), 0, packed.size());
+    }
+    test_qkv_projection_cases(large, prefix);
+    large.free();
 }
 
 struct Fixture {
@@ -446,6 +671,8 @@ static void test_swiglu(BreezeModel & m) {
 int main(int argc, char ** argv) {
     try {
         const bool gpu = argc > 1 && std::string(argv[1]) == "--gpu";
+        const bool scaled_only = (argc > 1 && std::string(argv[1]) == "--scaled-matvec-only") ||
+                                 (gpu && argc > 2 && std::string(argv[2]) == "--scaled-matvec-only");
         for (bool quantized : {false, true}) {
             Fixture fixture;
             fixture.init(gpu, quantized);
@@ -454,7 +681,17 @@ int main(int argc, char ** argv) {
                 return 77;
             }
             std::printf("testing %s with %s weights\n", fixture.model.backend.name(), quantized ? "Q8_0" : "F32");
+            if (scaled_only) {
+                test_scale_add_fusion(fixture.model.backend);
+                std::puts("scaled matvec-scale-add test passed");
+                return 0;
+            }
             test_graph(fixture.model.backend);
+            test_scale_add_fusion(fixture.model.backend);
+            if (gpu && quantized) {
+                test_qkv_projection_cases(fixture.model, "bb.blk.0");
+                test_qkv_projection_large();
+            }
             test_lora_projection(fixture.model);
             test_depth(fixture.model);
             test_fused(fixture.model);

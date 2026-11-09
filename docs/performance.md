@@ -2,12 +2,63 @@
 
 How fast this runs, what changed recently, and which settings are worth touching.
 
-Every number here was measured on one RTX 3060 12 GB with its tensor core limit
+Unless a section names another GPU, the numbers were measured on one RTX 3060 12 GB with its tensor core limit
 unlocked, on Vulkan unless a row says otherwise. The speed is the real time factor:
 seconds of audio per second of wall clock, so anything above `1.00x` is faster than
 playback. Repeat runs move by a few percent, and other programs using the GPU move them
 further, so measure your own card before you size anything from these tables.
 [Measuring](#measuring) shows how.
+
+## Vulkan LoRA projection optimization
+
+Single-column F16 LoRA projections can combine their matrix-vector product, scale
+and residual addition in one dispatch. The shader keeps the original F32 reduction,
+then applies the scale and addition separately. It does not quantize activations or
+merge LoRA weights into the base model.
+
+`BREEZE_FUSE_QKV=1` also packs the attention Q, K and V projections into a shared
+GPU cache. It supports single-token Q8_0 base projections with complete F16 LoRA
+pairs with power-of-two ranks from 4 to 256, including multiple adapters and their
+request weights. The loader places eligible Q/K/V weights in one allocation;
+the original separate tensors reference slices of the same bytes. Prefill and
+multi-column batches still use those separate tensors, without a second base-weight
+copy. Unsupported layouts keep their original allocation. Packed adapter weights
+are freed with their adapter, under the existing LoRA cache limit and idle timeout.
+
+The following settings were selected by repeated comparisons on an RTX 4070 12 GB:
+
+```text
+BREEZE_FUSE_QKV=1
+GGML_VK_MAX_NODES_PER_SUBMIT=256
+GGML_VK_F16_ROWS_SMALL=4
+GGML_VK_F16_ROWS_LARGE=1
+```
+
+The F16 row settings change the number of output rows handled together, preserving
+each row's reduction. Their defaults remain 2 and 2; other GPUs should be measured
+before changing them. Adapter packing still uses additional GPU memory, so compare
+memory as well as speed. These settings do not change weight formats, guidance, sampling,
+stream chunk sizes or the text encoder's device. They do not force MMVQ.
+
+Precision tests compare Q/K/V and scaled residual outputs bit for bit, including
+power-of-two LoRA ranks from 4 through 256. Real audio comparisons must also use the same reference,
+seed, weights and batching. An adaptive stream can change chunk boundaries as it
+gets faster; measure its first packet and playback buffer separately from fixed
+audio comparisons.
+
+### Keeping only the text vocabulary table in RAM
+
+`BREEZE_TE_EMBED_CPU=1` keeps `te.token_embd.weight` in system RAM and looks up
+the current tokens with one CPU thread. Only the selected F32 rows are transferred
+to the GPU; all text-encoder layers and its LoRA projection still run on the GPU.
+The bundled Q8 model's table is about 306 MiB. This is separate from `--te-cpu`,
+which moves the whole encoder to the CPU and takes precedence when both are set.
+`BREEZE_TE_THREADS` does not increase the embedding-only lookup's one-thread limit.
+
+The table keeps its original weight type and bytes. GPU/CPU lookup equivalence is
+checked bit for bit in the storage test, and real audio must be compared on the
+target backend before enabling it. This option defaults off; it does not move
+the backbone, depth decoder or vocoder to the CPU.
 
 ## What's new in v0.1.6
 
@@ -145,6 +196,9 @@ the text before any audio comes out, so it is the one part that can leave the GP
 without making the stream itself slower. It is meant for 4 to 6 GB cards, or for
 sharing a card with something like a local LLM. On a card with room to spare, leave
 it off.
+
+Role and effect LoRAs use the same device split: their `te.*` weights must be on
+the CPU too. Their backbone and depth-decoder weights stay on the GPU.
 
 `BREEZE_TE_THREADS` sets how many CPU threads it uses, by default half your cores. The
 C API and the Python bindings have no flag for it, set `BREEZE_TE_CPU=1` in the

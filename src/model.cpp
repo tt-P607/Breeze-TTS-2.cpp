@@ -13,19 +13,60 @@
 
 namespace breeze {
 
+static bool qkv_tensor_bytes(ggml_tensor * tensor, std::vector<uint8_t> & bytes) {
+    if (!tensor || !tensor->buffer) return false;
+    bytes.resize(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+    return true;
+}
+
+static bool qkv_cache_alloc(QkvProjectionCache & cache, Backend & backend,
+                            ggml_type type_a, int64_t a_ne0, int64_t a_ne1,
+                            const std::vector<uint8_t> & bytes_a,
+                            int64_t b_ne0 = 0, int64_t b_ne1 = 0,
+                            const std::vector<uint8_t> * bytes_b = nullptr) {
+    cache.release();
+    ggml_init_params params{ggml_tensor_overhead() * (bytes_b ? 2 : 1) + 4096, nullptr, true};
+    cache.ctx = ggml_init(params);
+    if (!cache.ctx) return false;
+
+    cache.a = ggml_new_tensor_2d(cache.ctx, type_a, a_ne0, a_ne1);
+    if (bytes_b) cache.b = ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F16, b_ne0, b_ne1);
+    if (!cache.a || (bytes_b && !cache.b) || ggml_nbytes(cache.a) != bytes_a.size() ||
+        (bytes_b && ggml_nbytes(cache.b) != bytes_b->size())) {
+        cache.release();
+        return false;
+    }
+    cache.buffer = ggml_backend_alloc_ctx_tensors(cache.ctx, backend.backend);
+    if (!cache.buffer) {
+        cache.release();
+        return false;
+    }
+    ggml_backend_tensor_set(cache.a, bytes_a.data(), 0, bytes_a.size());
+    if (bytes_b) ggml_backend_tensor_set(cache.b, bytes_b->data(), 0, bytes_b->size());
+    return true;
+}
+
 bool BreezeModel::load(const std::string & path, bool prefer_gpu, bool want_te_cpu) {
     backend.init(prefer_gpu);
+    const char * qkv_env = std::getenv("BREEZE_FUSE_QKV");
+    fuse_qkv = backend.is_gpu && qkv_env && strcmp(qkv_env, "1") == 0 &&
+               std::string(backend.name()).find("Vulkan") == 0;
     const char * te = std::getenv("BREEZE_TE_CPU");
     if (te && *te && strcmp(te, "0") != 0) want_te_cpu = true;
     te_cpu = backend.is_gpu && want_te_cpu;
-    if (te_cpu) {
+    const char * embedding = std::getenv("BREEZE_TE_EMBED_CPU");
+    te_embedding_cpu = backend.is_gpu && !te_cpu && embedding && strcmp(embedding, "1") == 0;
+    if (te_cpu || te_embedding_cpu) {
         cpu.init(false);
         const char * nt = std::getenv("BREEZE_TE_THREADS");
-        int n = nt ? std::atoi(nt) : (int) std::max(1u, std::thread::hardware_concurrency() / 2);
+        int n = te_cpu ? (nt ? std::atoi(nt) : (int) std::max(1u, std::thread::hardware_concurrency() / 2)) : 1;
         ggml_backend_cpu_set_n_threads(cpu.backend, std::max(1, n));
-        printf("text encoder: cpu, %d threads\n", std::max(1, n));
+        if (te_cpu) printf("text encoder: cpu, %d threads\n", std::max(1, n));
+        else printf("text embedding lookup: cpu, 1 thread; text encoder: gpu\n");
     }
-    if (!gg.load(path, backend, te_cpu ? &cpu : nullptr, te_cpu ? "te." : nullptr)) return false;
+    const char * cpu_prefix = te_cpu ? "te." : te_embedding_cpu ? "te.token_embd.weight" : nullptr;
+    if (!gg.load(path, backend, cpu_prefix ? &cpu : nullptr, cpu_prefix, fuse_qkv)) return false;
     cfg = parse_config(gg);
     if (!tok.load(gg)) return false;
     return true;
@@ -38,7 +79,7 @@ bool BreezeModel::load_lora(const std::string & id, const std::string & path) {
     }
 
     auto adapter = std::make_unique<LoraAdapter>();
-    if (!adapter->gg.load(path, backend)) {
+    if (!adapter->gg.load(path, backend, te_cpu ? &cpu : nullptr, te_cpu ? "te." : nullptr)) {
         fprintf(stderr, "failed to load LoRA adapter: %s\n", path.c_str());
         return false;
     }
@@ -154,13 +195,174 @@ ggml_tensor * BreezeModel::project(ggml_context * ctx, const std::string & weigh
     return out;
 }
 
+bool BreezeModel::project_qkv(ggml_context * ctx, const std::string & prefix, ggml_tensor * x,
+                              std::array<ggml_tensor *, 3> & outputs) {
+    if (!fuse_qkv || !ctx || !x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) ||
+        x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1) {
+        return false;
+    }
+
+    auto & base_entry = qkv_base_cache[prefix];
+    if (!base_entry) base_entry = std::make_unique<QkvProjectionCache>();
+    QkvProjectionCache & base_cache = *base_entry;
+    if (!base_cache.initialized) {
+        base_cache.initialized = true;
+        const std::array<std::string, 3> base_names = {
+            prefix + ".attn_q.weight", prefix + ".attn_k.weight", prefix + ".attn_v.weight",
+        };
+        std::array<ggml_tensor *, 3> base_weights{};
+        for (size_t i = 0; i < base_weights.size(); ++i) base_weights[i] = gg.find(base_names[i]);
+        if (!base_weights[0] || !base_weights[1] || !base_weights[2]) return false;
+        const int64_t k = base_weights[0]->ne[0];
+        if (k <= 0) return false;
+        std::array<int64_t, 3> rows{};
+        int64_t sum_rows = 0;
+        // Keep each row's workgroup and reduction identical to the separate projections.
+        for (size_t i = 0; i < base_weights.size(); ++i) {
+            ggml_tensor * w = base_weights[i];
+            if (!w->buffer || w->type != GGML_TYPE_Q8_0 || !ggml_is_contiguous(w) ||
+                w->ne[0] != k || w->ne[1] <= 0 || w->ne[2] != 1 || w->ne[3] != 1 ||
+                w->ne[1] > 8192 - sum_rows) {
+                return false;
+            }
+            rows[i] = w->ne[1];
+            sum_rows += rows[i];
+        }
+        if (k % 32 != 0 || x->ne[0] != k) return false;
+
+        const auto shared = gg.packed_qkv.find(prefix);
+        if (shared != gg.packed_qkv.end()) {
+            base_cache.a = shared->second;
+        } else {
+            size_t total_bytes = 0;
+            for (ggml_tensor * w : base_weights) total_bytes += ggml_nbytes(w);
+            std::vector<uint8_t> packed(total_bytes);
+            size_t offset = 0;
+            for (ggml_tensor * w : base_weights) {
+                const size_t size = ggml_nbytes(w);
+                ggml_backend_tensor_get(w, packed.data() + offset, 0, size);
+                offset += size;
+            }
+            if (!qkv_cache_alloc(base_cache, backend, GGML_TYPE_Q8_0, k, sum_rows, packed)) return false;
+        }
+        base_cache.k = k;
+        base_cache.rows = rows;
+        base_cache.supported = true;
+    }
+    if (!base_cache.supported) return false;
+
+    std::vector<std::pair<const ActiveLora *, QkvProjectionCache *>> lora_caches;
+    lora_caches.reserve(active_loras.size());
+    for (const ActiveLora & active : active_loras) {
+        if (active.weight == 0.0f) continue;
+        if (!active.adapter) return false;
+
+        auto & lora_entry = active.adapter->qkv_cache[prefix];
+        if (!lora_entry) lora_entry = std::make_unique<QkvProjectionCache>();
+        QkvProjectionCache & lora_cache = *lora_entry;
+        if (!lora_cache.initialized) {
+            lora_cache.initialized = true;
+            const std::array<std::string, 3> base_names = {
+                prefix + ".attn_q.weight", prefix + ".attn_k.weight", prefix + ".attn_v.weight",
+            };
+            std::array<ggml_tensor *, 3> a{}, b{};
+            bool any = false;
+            bool complete = true;
+            for (size_t i = 0; i < a.size(); ++i) {
+                a[i] = active.adapter->gg.find(base_names[i] + ".lora_a");
+                b[i] = active.adapter->gg.find(base_names[i] + ".lora_b");
+                any |= a[i] != nullptr || b[i] != nullptr;
+                complete &= a[i] != nullptr && b[i] != nullptr;
+            }
+            if (!any) {
+                lora_cache.k = base_cache.k;
+                lora_cache.rows = base_cache.rows;
+                lora_cache.supported = true;
+            } else if (!complete) {
+                lora_cache.supported = false;
+            } else {
+                const int64_t rank = a[0]->ne[1];
+                const bool valid_rank = rank >= 4 && rank <= 256 && (rank & (rank - 1)) == 0 && 3 * rank < 1024;
+                bool valid = valid_rank;
+                for (size_t i = 0; i < a.size() && valid; ++i) {
+                    valid = a[i]->type == GGML_TYPE_F16 && b[i]->type == GGML_TYPE_F16 &&
+                            ggml_is_contiguous(a[i]) && ggml_is_contiguous(b[i]) &&
+                            a[i]->ne[0] == base_cache.k && a[i]->ne[1] == rank &&
+                            a[i]->ne[2] == 1 && a[i]->ne[3] == 1 &&
+                            b[i]->ne[0] == rank && b[i]->ne[1] == base_cache.rows[i] &&
+                            b[i]->ne[2] == 1 && b[i]->ne[3] == 1;
+                }
+                if (!valid) {
+                    lora_cache.supported = false;
+                } else {
+                    std::array<std::vector<uint8_t>, 3> a_bytes, b_bytes;
+                    std::vector<uint8_t> packed_a;
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        if (!qkv_tensor_bytes(a[i], a_bytes[i]) || !qkv_tensor_bytes(b[i], b_bytes[i])) {
+                            valid = false;
+                            break;
+                        }
+                        packed_a.insert(packed_a.end(), a_bytes[i].begin(), a_bytes[i].end());
+                    }
+                    if (!valid) {
+                        lora_cache.supported = false;
+                    } else {
+                        const size_t scalar_bytes = ggml_type_size(GGML_TYPE_F16);
+                        const size_t source_row_bytes = (size_t)rank * scalar_bytes;
+                        const size_t packed_row_bytes = (size_t)(3 * rank) * scalar_bytes;
+                        const size_t total_rows = (size_t)(base_cache.rows[0] + base_cache.rows[1] + base_cache.rows[2]);
+                        std::vector<uint8_t> packed_b(packed_row_bytes * total_rows, 0);
+                        size_t output_row = 0;
+                        for (size_t i = 0; i < b.size(); ++i) {
+                            for (int64_t row = 0; row < base_cache.rows[i]; ++row) {
+                                const size_t dst_offset = (output_row + row) * packed_row_bytes + i * source_row_bytes;
+                                const size_t src_offset = (size_t)row * source_row_bytes;
+                                std::memcpy(packed_b.data() + dst_offset, b_bytes[i].data() + src_offset, source_row_bytes);
+                            }
+                            output_row += (size_t)base_cache.rows[i];
+                        }
+                        if (qkv_cache_alloc(lora_cache, backend, GGML_TYPE_F16, base_cache.k, 3 * rank, packed_a,
+                                            3 * rank, total_rows, &packed_b)) {
+                            lora_cache.k = base_cache.k;
+                            lora_cache.rows = base_cache.rows;
+                            lora_cache.supported = true;
+                        } else {
+                            lora_cache.supported = false;
+                        }
+                    }
+                }
+            }
+        }
+        if (!lora_cache.supported || lora_cache.k != base_cache.k || lora_cache.rows != base_cache.rows) return false;
+        if (lora_cache.a) lora_caches.emplace_back(&active, &lora_cache);
+    }
+
+    ggml_tensor * combined = ggml_mul_mat(ctx, base_cache.a, x);
+    for (const auto & [active, lora_cache] : lora_caches) {
+        ggml_tensor * low_rank = ggml_mul_mat(ctx, lora_cache->a, x);
+        ggml_tensor * delta = ggml_mul_mat(ctx, lora_cache->b, low_rank);
+        combined = ggml_add(ctx, combined,
+                            ggml_scale(ctx, delta, active->adapter->scale * active->weight));
+    }
+
+    const int64_t q_rows = base_cache.rows[0];
+    const int64_t k_rows = base_cache.rows[1];
+    outputs[0] = ggml_view_1d(ctx, combined, q_rows, 0);
+    outputs[1] = ggml_view_1d(ctx, combined, k_rows, (size_t)q_rows * sizeof(float));
+    outputs[2] = ggml_view_1d(ctx, combined, base_cache.rows[2], (size_t)(q_rows + k_rows) * sizeof(float));
+    return true;
+}
+
 void BreezeModel::free() {
     clear_lora();
     lora_stacks.clear();
     loras.clear();
+    qkv_base_cache.clear();
     gg.free();
-    if (te_cpu) cpu.free();
+    if (cpu.backend) cpu.free();
     backend.free();
+    fuse_qkv = false;
+    te_embedding_cpu = false;
 }
 
 }

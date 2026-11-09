@@ -16,11 +16,14 @@ struct GGUFModel {
     ggml_context * meta = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     std::unordered_map<std::string, ggml_tensor *> tensors;
+    std::unordered_map<std::string, ggml_tensor *> packed_qkv;
 
     // tensors starting with cpu_prefix live on cpu_be instead
-    bool load(const std::string & path, Backend & be, Backend * cpu_be = nullptr, const char * cpu_prefix = nullptr);
+    bool load(const std::string & path, Backend & be, Backend * cpu_be = nullptr, const char * cpu_prefix = nullptr, bool pack_qkv = false);
     ggml_context * meta_cpu = nullptr;
     ggml_backend_buffer_t buffer_cpu = nullptr;
+    ggml_context * meta_packed = nullptr;
+    ggml_backend_buffer_t buffer_packed = nullptr;
     void free();
 
     ggml_tensor * get(const std::string & name) const;

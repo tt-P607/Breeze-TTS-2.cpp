@@ -28,6 +28,13 @@ If you already cloned without `--recursive`:
 git submodule update --init --recursive
 ```
 
+This fork pins `third_party/ggml` to
+[`tt-P607/ggml`](https://github.com/tt-P607/ggml/tree/c77946bc86c3a645bc07c44f4391067218951551)
+for the same-order Vulkan LoRA scale/add fusion. The dependency commit is published;
+no local patch step or uncommitted submodule changes are needed. When updating an
+existing checkout, run `git submodule sync --recursive` before updating submodules.
+The original backend remains [ggml-org/ggml](https://github.com/ggml-org/ggml).
+
 ## Configure and build
 
 GPU (Vulkan):

@@ -61,9 +61,13 @@ static ggml_tensor * bb_layer(ggml_context * ctx, BreezeModel & m, Graph & g, co
     ggml_tensor * res = x;
     ggml_tensor * h = rms_norm(ctx, x, m.w(p + ".attn_norm.weight"), c.rms_eps);
 
-    ggml_tensor * q = ggml_reshape_3d(ctx, project(".attn_q.weight", h), c.head_dim, c.n_head, n);
-    ggml_tensor * k = ggml_reshape_3d(ctx, project(".attn_k.weight", h), c.head_dim, c.n_kv_head, n);
-    ggml_tensor * v = ggml_reshape_3d(ctx, project(".attn_v.weight", h), c.head_dim, c.n_kv_head, n);
+    std::array<ggml_tensor *, 3> projections;
+    if (!m.project_qkv(ctx, p, h, projections)) {
+        projections = {project(".attn_q.weight", h), project(".attn_k.weight", h), project(".attn_v.weight", h)};
+    }
+    ggml_tensor * q = ggml_reshape_3d(ctx, projections[0], c.head_dim, c.n_head, n);
+    ggml_tensor * k = ggml_reshape_3d(ctx, projections[1], c.head_dim, c.n_kv_head, n);
+    ggml_tensor * v = ggml_reshape_3d(ctx, projections[2], c.head_dim, c.n_kv_head, n);
     q = rms_norm(ctx, q, m.w(p + ".attn_q_norm.weight"), c.rms_eps);
     k = rms_norm(ctx, k, m.w(p + ".attn_k_norm.weight"), c.rms_eps);
     q = ggml_rope_ext(ctx, q, pos, nullptr, c.head_dim, GGML_ROPE_TYPE_NEOX, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);

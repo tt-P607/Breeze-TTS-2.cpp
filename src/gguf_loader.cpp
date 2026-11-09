@@ -1,5 +1,7 @@
 #include "breeze/gguf_loader.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -14,7 +16,7 @@ namespace breeze {
 #define breeze_fseek fseeko
 #endif
 
-bool GGUFModel::load(const std::string & path, Backend & be, Backend * cpu_be, const char * cpu_prefix) {
+bool GGUFModel::load(const std::string & path, Backend & be, Backend * cpu_be, const char * cpu_prefix, bool pack_qkv) {
     free();
     gguf_init_params gp{ /*no_alloc=*/true, /*ctx=*/&meta };
     gguf = gguf_init_from_file(path.c_str(), gp);
@@ -45,6 +47,81 @@ bool GGUFModel::load(const std::string & path, Backend & be, Backend * cpu_be, c
                 return false;
             }
             for (auto & [t, d] : twins) { t->data = d->data; t->buffer = d->buffer; }
+        }
+    }
+
+    if (pack_qkv) {
+        struct QKVGroup {
+            std::string prefix;
+            std::array<ggml_tensor *, 3> parts;
+            std::array<size_t, 3> offsets;
+            ggml_tensor * packed = nullptr;
+        };
+        std::vector<QKVGroup> groups;
+        const int64_t nt = gguf_get_n_tensors(gguf);
+        const size_t alignment = std::max<size_t>(1, ggml_backend_get_alignment(be.backend));
+        constexpr char q_suffix[] = ".attn_q.weight";
+
+        for (int64_t i = 0; i < nt; i++) {
+            const char * raw_name = gguf_get_tensor_name(gguf, i);
+            const std::string q_name(raw_name);
+            if (q_name.size() <= sizeof(q_suffix) - 1 ||
+                q_name.compare(q_name.size() - (sizeof(q_suffix) - 1), sizeof(q_suffix) - 1, q_suffix) != 0) continue;
+            const std::string prefix = q_name.substr(0, q_name.size() - (sizeof(q_suffix) - 1));
+            if (prefix.rfind("bb.", 0) != 0 && prefix.rfind("dd.", 0) != 0) continue;
+
+            std::array<ggml_tensor *, 3> parts = {
+                ggml_get_tensor(meta, q_name.c_str()),
+                ggml_get_tensor(meta, (prefix + ".attn_k.weight").c_str()),
+                ggml_get_tensor(meta, (prefix + ".attn_v.weight").c_str()),
+            };
+            ggml_tensor * q = parts[0];
+            if (!q || !parts[1] || !parts[2]) continue;
+            bool eligible = true;
+            int64_t rows = 0;
+            for (ggml_tensor * t : parts) {
+                eligible = eligible && t->type == GGML_TYPE_Q8_0 && ggml_n_dims(t) == 2 &&
+                           ggml_is_contiguous(t) && t->ne[0] == q->ne[0] && t->ne[1] > 0 &&
+                           t->data == nullptr && t->buffer == nullptr;
+                if (t->ne[1] <= 0 || t->ne[1] > 8192 - rows) eligible = false;
+                else rows += t->ne[1];
+            }
+            if (!eligible) continue;
+
+            std::array<size_t, 3> sizes = { ggml_nbytes(parts[0]), ggml_nbytes(parts[1]), ggml_nbytes(parts[2]) };
+            std::array<size_t, 3> offsets = { 0, sizes[0], sizes[0] + sizes[1] };
+            if (offsets[1] % alignment != 0 || offsets[2] % alignment != 0) continue;
+            groups.push_back({ prefix, parts, offsets, nullptr });
+        }
+
+        if (!groups.empty()) {
+            ggml_init_params pp{ ggml_tensor_overhead() * (groups.size() + 1), nullptr, true };
+            meta_packed = ggml_init(pp);
+            if (!meta_packed) {
+                free();
+                return false;
+            }
+            for (QKVGroup & group : groups) {
+                const int64_t rows = group.parts[0]->ne[1] + group.parts[1]->ne[1] + group.parts[2]->ne[1];
+                group.packed = ggml_new_tensor_2d(meta_packed, GGML_TYPE_Q8_0, group.parts[0]->ne[0], rows);
+                ggml_set_name(group.packed, (group.prefix + ".attn_qkv.weight").c_str());
+                packed_qkv[group.prefix] = group.packed;
+            }
+            buffer_packed = ggml_backend_alloc_ctx_tensors(meta_packed, be.backend);
+            if (buffer_packed) {
+                for (QKVGroup & group : groups) {
+                    for (size_t i = 0; i < group.parts.size(); i++) {
+                        group.parts[i]->data = (uint8_t *) group.packed->data + group.offsets[i];
+                        group.parts[i]->buffer = group.packed->buffer;
+                    }
+                }
+                printf("QKV shared storage: %zu groups, %.1f MiB\n", groups.size(),
+                       ggml_backend_buffer_get_size(buffer_packed) / (1024.0 * 1024.0));
+            } else {
+                ggml_free(meta_packed);
+                meta_packed = nullptr;
+                packed_qkv.clear();
+            }
         }
     }
 
@@ -89,12 +166,17 @@ bool GGUFModel::load(const std::string & path, Backend & be, Backend * cpu_be, c
 void GGUFModel::free() {
     if (buffer) ggml_backend_buffer_free(buffer);
     if (buffer_cpu) ggml_backend_buffer_free(buffer_cpu);
+    if (buffer_packed) ggml_backend_buffer_free(buffer_packed);
     if (meta_cpu) ggml_free(meta_cpu);
+    if (meta_packed) ggml_free(meta_packed);
     buffer_cpu = nullptr;
     meta_cpu = nullptr;
+    buffer_packed = nullptr;
+    meta_packed = nullptr;
     if (meta) ggml_free(meta);
     if (gguf) gguf_free(gguf);
     tensors.clear();
+    packed_qkv.clear();
     buffer = nullptr;
     meta = nullptr;
     gguf = nullptr;
