@@ -54,7 +54,7 @@ struct ActiveLora {
 
 struct BreezeModel {
     Backend backend;
-    // Full text encoding or the optional one-thread embedding lookup.
+    // only used to offload text-encoder weights or embedding lookup
     Backend cpu;
     bool te_cpu = false;
     bool te_embedding_cpu = false;

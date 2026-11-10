@@ -3,7 +3,8 @@
 How fast this runs, what changed recently, and which settings are worth touching.
 
 Unless a section names another GPU, the numbers were measured on one RTX 3060 12 GB with its tensor core limit
-unlocked, on Vulkan unless a row says otherwise. The speed is the real time factor:
+unlocked, on Vulkan unless a row says otherwise. The [RTX 3080](#rtx-3080) sections
+are a stock card. The speed is the real time factor:
 seconds of audio per second of wall clock, so anything above `1.00x` is faster than
 playback. Repeat runs move by a few percent, and other programs using the GPU move them
 further, so measure your own card before you size anything from these tables.
@@ -102,8 +103,9 @@ seeds. All of the gain is in the vocoder, the backbone and depth decoder did not
 5. **Leave the warm up on.** It costs a few seconds at startup and saves that time on
    the requests your users are waiting for.
 6. **Do not judge the first run.** See [The first run is slower](#the-first-run-is-slower).
-7. **Out of video memory?** `--te-cpu` saves about 1 GB, but not together with
-   `--parallel`. See [Short on video memory](#short-on-video-memory).
+7. **Out of video memory?** `BREEZE_TE_EMBED_CPU=1` saves about 300 MB for free, and
+   `--te-cpu` about 1 GB, but not together with `--parallel`. See
+   [Short on video memory](#short-on-video-memory).
 
 ## Picking a model
 
@@ -115,6 +117,25 @@ One stream, per frame of audio (80 ms):
 | Q8_0 with a Q4_K depth decoder | 3.4 GB | 2.32x | 1.69x |
 | Q8_0 | 3.6 GB | 1.99x | 1.58x |
 | F16 | 6.3 GB | 1.42x | |
+
+### RTX 3080
+
+The same build on a stock RTX 3080 12 GB, with no tensor core unlock, on Vulkan. Median
+of 4 seeds, with first audio from `breeze-cli` after a warm run:
+
+| Model | `cfg_scale` 1 | `cfg_scale` 3 | First audio |
+| --- | --- | --- | --- |
+| Q4_K | 3.50x | 2.81x | about 140 ms |
+| Q6_K | 3.67x | 2.87x | about 130 ms |
+| Q8_0 with a Q4_K depth decoder | 3.72x | 2.83x | about 80 ms |
+| Q8_0 | 3.16x | 2.71x | about 145 ms |
+| F16 | 2.71x | 2.32x | about 140 ms |
+
+Per frame at Q8_0 that is 5.7 ms backbone, 17.9 ms depth decoder and 1.8 ms vocoder.
+The 3080 has about 2.5 times the memory bandwidth of the 3060, so the weight type matters much less: Q8_0 is only about 10% behind Q4_K,
+Q6_K is as fast as Q4_K, and F16 is faster than Q4_K was on the 3060. About one run in
+four had one slow vocoder flush, from other programs on the GPU, which is why these are
+medians.
 
 Quantising the depth decoder is the biggest single speed gain, and it holds up well
 with several streams, but it damages the high end of the audio and the damage grows
@@ -161,6 +182,25 @@ load instead of letting it stutter.
 | Q8_0 or Q4_K | `4` | Works, and also fits 2 streams with guidance. The speed gets close enough to 1x that other GPU use can cause gaps. |
 | Q8_0 with Q4_K depth | `4` | Still 1.18x or better on every stream. |
 | F16 | `2` | |
+
+### Several streams on an RTX 3080
+
+The stock RTX 3080 at `--parallel 6`, the same way: streams one second apart, a client
+that plays from the first packet and buffers nothing, about 15 to 20 s of audio each:
+
+| Streams | Q4_K | Q8_0 with Q4_K depth | Q8_0 | F16 |
+| --- | --- | --- | --- | --- |
+| 3 | 2.30x to 2.39x | 1.93x to 2.12x | 1.84x to 1.92x | 1.95x to 2.14x |
+| 4 | 1.94x to 2.13x | 1.92x to 2.08x | 1.59x to 1.70x | 1.60x to 1.69x |
+| 5 | 1.70x to 1.91x | 1.69x to 1.93x | 1.46x to 1.68x | 1.47x to 1.61x |
+| 1 with guidance, 2 without | 1.95x to 2.29x | 1.81x to 1.95x | 1.75x to 1.88x | 1.67x to 1.72x |
+| 2 with guidance | 1.82x to 1.85x | 1.89x to 1.97x | 1.78x | 1.70x to 1.71x |
+| 3 with guidance | 1.46x to 1.69x | 1.49x to 1.58x | 1.42x to 1.51x | 1.24x to 1.28x |
+
+None of these had gaps, apart from one 18 ms gap in five streams of Q8_0 with Q4_K
+depth. Three streams with guidance, which could not keep up on the 3060, now run at
+about 1.5x. So on a 3080, `--parallel 6` is safe with any of these models, and it
+fits 5 streams without guidance or 3 with it.
 
 On another card, start from how fast one stream runs. Batching helps more than you
 would guess because the streams share each read of the weights: F16 runs one stream at
@@ -232,6 +272,15 @@ generates every stream, so while it encodes, all the other streams stop. With
 for 0.7 to 1.3 s. Streams sharing the GPU only run about 1.1 to 1.3x faster than
 playback, so they cannot make that up and you would hear gaps. This combination has not
 been measured, so if you have to use both, test it with your own clients first.
+
+**A smaller saving that costs nothing.** `BREEZE_TE_EMBED_CPU=1` moves only the text
+encoder's word table into system memory, about 306 MB at Q8_0. The text encoder itself
+stays on the GPU, and the CPU only looks up the rows for the words in your text and
+sends them over. On the RTX 3080 at Q8_0 it saved about 300 to 440 MB, the audio was
+identical byte for byte, and first audio did not change. Any value except `0` turns it
+on, and since it is an environment setting it works the same for the CLI, the server,
+the C API and the Python bindings. If `--te-cpu` or `BREEZE_TE_CPU` is set too, that
+wins, because it moves the whole text encoder anyway.
 
 ## Tuning settings
 

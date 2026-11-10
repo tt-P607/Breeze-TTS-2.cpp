@@ -27,6 +27,7 @@ breeze-server <model.gguf> [--host H] [--port P] [--webui] [--cpu]
                            [--voices-dir PATH] [--ws-port P] [--split-chars N]
                            [--cors [ORIGINS]] [--no-warmup] [--parallel N]
                            [--lora-cache-size N] [--lora-idle-seconds N]
+                           [--talk] [--llm URL] [--tyger URL]
 ```
 
 | Flag | Default | Meaning |
@@ -49,6 +50,9 @@ breeze-server <model.gguf> [--host H] [--port P] [--webui] [--cpu]
 | `--switchable-lora ID=PATH` | none | Register a LoRA adapter without loading it. See [lora.md](lora.md). |
 | `--lora-cache-size` | `3` | Adapters retained between requests. Busy overflow is allowed and unloaded after its last user finishes. The base model is shared. |
 | `--lora-idle-seconds` | `900` | Unload an adapter after this many seconds without a request using it. |
+| `--talk` | off | Serve the voice call demo at `/talk`. See [Voice call demo](#voice-call-demo). |
+| `--llm` | `http://127.0.0.1:1234/v1` with `--talk` | OpenAI compatible server the demo gets its replies from, passed through under `/llm/`. |
+| `--tyger` | `ws://127.0.0.1:8765/ws` | tyger-server websocket the demo uses for turn taking. |
 
 ```
 breeze-server breeze-tts-2-q4_k.gguf --port 8137 --webui
@@ -644,3 +648,73 @@ until generation ends; only a successful completion reaches 100%. WebSocket
 pieces use their captured instructions and separate request numbers. Updates
 flush immediately for both a console and a process manager; request blocks and
 progress lines share an output lock to keep concurrent requests readable.
+
+## Voice call demo
+
+`--talk` serves a voice call page at `/talk`. You pick a character, it picks up,
+and you talk to it out loud. It needs two other things running:
+
+- [tyger-server](https://github.com/HoppouAI/tyger.cpp) for speech recognition and
+  turn taking. It decides when you finished talking, when you are interrupting, and
+  when a short "mm-hmm" fits.
+- Any OpenAI compatible chat server, such as LM Studio, Ollama or llama.cpp's
+  server, for the replies. The page calls it through `/llm/` on this server, so
+  the chat server does not need CORS.
+
+```
+tyger-server -m models/tyger-q8_0.gguf --port 8765
+breeze-server breeze-tts-2-q4_k.gguf --talk --llm http://127.0.0.1:1234/v1
+```
+
+Then open http://127.0.0.1:8080/talk. Headphones work best, since the page has
+no echo cancellation of its own beyond what the browser does.
+
+The page reaches everything through the address you opened it on. The speech
+socket goes to that host, the chat server goes through `/llm/` on this server,
+and a loopback `--tyger` address like the default is swapped for that host
+too. To use it from another device, start both servers with `--host 0.0.0.0`.
+Browsers only allow the microphone on https or on localhost, so from another
+device the page has to be served over https, for example behind a reverse
+proxy. Behind https the sockets switch to `wss://` on their own.
+
+| Route | Serves |
+| --- | --- |
+| `GET /talk` | the page |
+| `GET /talk/config` | websocket port, tyger address and sample rate for the page |
+| `GET, POST /llm/...` | passed through to the `--llm` server, streaming |
+
+Replies stream from the chat server straight into a [WebSocket](websocket.md)
+session. The first clause goes out with `flush` so speech starts before the
+sentence is finished, and the rest follows as `text`. When you talk over the
+character the session is cancelled, and only the part you actually heard goes
+into the chat history, ending in "..." so the model knows it was cut off.
+
+Everything is set in the page under Settings and kept in the browser:
+
+- **Characters.** Name, color, personality and an optional opening line. The
+  voice is either a saved voice or a description for voice design. A saved voice
+  sounds the same every call; a designed one changes a little each time. The
+  page can also clone a new voice from a file or a recording, transcribing it
+  with tyger.
+- **Speaking rules.** Added after every character's personality. The defaults
+  keep replies short and casual, use "..." for pauses, and allow vocal event tags
+  like `(laugh)` or `(sigh)` so the voice can actually laugh.
+- **Turn taking.** How long to wait before replying, whether you can interrupt
+  and how easily, and backchannels. tyger's own interrupt score misses short
+  ones like "wait, hold on", so talking over the character for about a second
+  stops it too. When an interruption turns out to be just "mm-hmm" or nothing
+  at all, the character picks up where it stopped. Backchannels are short
+  phrases made once per call in the character's voice; with no saved voice
+  they start after the first reply, cloned from it. They can also be written
+  by the chat model from what you are saying, which fits better but takes
+  about a second each.
+- **Voice.** Guidance and temperature for the speech model.
+- **Screen sharing.** The Share screen button in a call lets the character see
+  your screen, like a video call. While you share, a fresh picture of the
+  screen goes with everything you say, and only the newest one is sent, so the
+  chat history stays text. It needs a chat model that takes images. If yours
+  does not, the page says so and the character answers without the picture.
+  The picture size setting trades readable small text against time before
+  each reply.
+- **Conversation.** Which chat model, temperature, reply length, an API key for
+  hosted servers, and whether to skip the thinking step on reasoning models.

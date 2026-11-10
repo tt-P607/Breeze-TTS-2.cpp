@@ -59,12 +59,12 @@ std::vector<float> text_encoder_forward(BreezeModel & m, const std::vector<int> 
     ggml_tensor * x;
     if (m.te_embedding_cpu) {
         Graph lookup(16);
-        auto * ids = lookup.input_i32(tok_i, T);
-        auto * rows = ggml_get_rows(lookup.ctx, m.w("te.token_embd.weight"), ids);
+        ggml_tensor * ids = lookup.input_i32(tok_i, T);
+        ggml_tensor * rows = ggml_get_rows(lookup.ctx, m.w("te.token_embd.weight"), ids);
         lookup.compute(m.cpu, rows);
         x = g.input_f32(tensor_to_f32(rows), c.hidden, T);
     } else {
-        auto * tok = g.input_i32(tok_i, T);
+        ggml_tensor * tok = g.input_i32(tok_i, T);
         x = ggml_get_rows(g.ctx, m.w("te.token_embd.weight"), tok);
     }
     x = ggml_scale(g.ctx, x, c.embed_scale);

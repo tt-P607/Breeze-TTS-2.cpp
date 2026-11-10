@@ -69,6 +69,17 @@ endif()
 # windows hands argv and narrow paths over in the ansi code page unless the exe opts into utf-8
 set(BREEZE_UTF8_RC ${CMAKE_CURRENT_BINARY_DIR}/generated/utf8.rc)
 file(WRITE ${BREEZE_UTF8_RC} "1 24 \"${CMAKE_CURRENT_SOURCE_DIR}/cmake/utf8.manifest\"\n")
+# newer mingw links its own default manifest under the same id and ld keeps both, an empty stand in found first via -B stops that
+if(MINGW)
+    set(BREEZE_NOMANIFEST ${CMAKE_CURRENT_BINARY_DIR}/generated/nomanifest)
+    file(MAKE_DIRECTORY ${BREEZE_NOMANIFEST})
+    file(WRITE ${BREEZE_NOMANIFEST}/empty.c "")
+    execute_process(COMMAND ${CMAKE_C_COMPILER} -c ${BREEZE_NOMANIFEST}/empty.c -o ${BREEZE_NOMANIFEST}/default-manifest.o
+                    RESULT_VARIABLE nomanifest_rc)
+    if(nomanifest_rc EQUAL 0)
+        add_link_options(-B${BREEZE_NOMANIFEST}/)
+    endif()
+endif()
 function(breeze_utf8 target)
     if(MSVC)
         target_sources(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cmake/utf8.manifest)
@@ -105,6 +116,11 @@ if(BREEZE_BUILD_TESTS)
     breeze_utf8(breeze-test-model-storage)
     add_test(NAME model-storage-gpu COMMAND breeze-test-model-storage)
     set_tests_properties(model-storage-gpu PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(breeze-test-text-embedding tests/text_embedding.cpp)
+    target_link_libraries(breeze-test-text-embedding PRIVATE breeze_core)
+    breeze_utf8(breeze-test-text-embedding)
+    add_test(NAME text-embedding-gpu COMMAND breeze-test-text-embedding)
+    set_tests_properties(text-embedding-gpu PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(breeze-test-vocoder tests/vocoder_stream.cpp)
     target_link_libraries(breeze-test-vocoder PRIVATE breeze_core)
     breeze_utf8(breeze-test-vocoder)
@@ -124,6 +140,9 @@ add_custom_command(
         ${CMAKE_CURRENT_SOURCE_DIR}/webui/index.html
         ${CMAKE_CURRENT_SOURCE_DIR}/webui/style.css
         ${CMAKE_CURRENT_SOURCE_DIR}/webui/app.js
+        ${CMAKE_CURRENT_SOURCE_DIR}/webui/talk.html
+        ${CMAKE_CURRENT_SOURCE_DIR}/webui/talk.css
+        ${CMAKE_CURRENT_SOURCE_DIR}/webui/talk.js
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_webui.cmake
     COMMENT "Embedding WebUI assets"
     VERBATIM
@@ -154,7 +173,7 @@ breeze_utf8(breeze-quantize)
 if(BREEZE_BUILD_SERVER)
     add_executable(breeze-server apps/server/main.cpp apps/server/server.cpp apps/server/models.cpp apps/server/batch.cpp apps/server/voices.cpp
                                  apps/server/ws.cpp apps/server/ws_api.cpp apps/server/openai.cpp
-                                 apps/server/encode.cpp)
+                                 apps/server/encode.cpp apps/server/llm_proxy.cpp)
     add_dependencies(breeze-server breeze_webui)
     target_include_directories(breeze-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated third_party)
     target_link_libraries(breeze-server PRIVATE breeze_core)
